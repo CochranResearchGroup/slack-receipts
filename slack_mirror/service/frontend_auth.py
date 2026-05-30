@@ -1,0 +1,487 @@
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import secrets
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+from slack_mirror.core import db
+from slack_mirror.service.errors import RateLimitError
+
+HOSTED_AUTH_COOKIE_NAME = "slack_mirror_hosted_session"
+PASSWORD_HASH_ITERATIONS = 600_000
+HOSTED_AUTH_SESSION_DAYS = 30
+HOSTED_AUTH_SESSION_IDLE_TIMEOUT_SECONDS = 43200
+HOSTED_AUTH_LOGIN_ATTEMPT_WINDOW_SECONDS = 900
+HOSTED_AUTH_LOGIN_ATTEMPT_MAX_FAILURES = 5
+
+
+@dataclass(frozen=True)
+class FrontendAuthConfig:
+    enabled: bool
+    allow_registration: bool
+    registration_allowlist: tuple[str, ...]
+    cookie_name: str
+    cookie_secure_mode: str
+    session_days: int
+    session_idle_timeout_seconds: int
+    login_attempt_window_seconds: int
+    login_attempt_max_failures: int
+
+
+@dataclass(frozen=True)
+class FrontendAuthSession:
+    authenticated: bool
+    user_id: int | None = None
+    username: str | None = None
+    display_name: str | None = None
+    session_id: int | None = None
+    auth_source: str = "none"
+    expires_at: str | None = None
+
+
+@dataclass(frozen=True)
+class FrontendAuthIssueResult:
+    payload: FrontendAuthSession
+    session_token: str
+
+
+@dataclass(frozen=True)
+class FrontendAuthProvisionResult:
+    user_id: int
+    username: str
+    display_name: str | None
+    created: bool
+    password_updated: bool
+
+
+def _parse_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_registration_allowlist(value: Any) -> tuple[str, ...]:
+    candidates: list[str] = []
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        candidates = [part.strip() for part in value.split(",")]
+    elif isinstance(value, (list, tuple, set)):
+        candidates = [str(part).strip() for part in value]
+    else:
+        candidates = [str(value).strip()]
+    normalized = []
+    for candidate in candidates:
+        cleaned = db.normalize_auth_username(candidate)
+        if cleaned and cleaned not in normalized:
+            normalized.append(cleaned)
+    return tuple(normalized)
+
+
+def frontend_auth_config(raw_config: dict[str, Any]) -> FrontendAuthConfig:
+    service_cfg = raw_config.get("service") or {}
+    auth_cfg = service_cfg.get("auth") or {}
+    cookie_name = str(auth_cfg.get("cookie_name") or HOSTED_AUTH_COOKIE_NAME).strip() or HOSTED_AUTH_COOKIE_NAME
+    secure_mode = str(auth_cfg.get("cookie_secure_mode") or "").strip().lower()
+    if not secure_mode:
+        if "cookie_secure" in auth_cfg:
+            secure_mode = "always" if _parse_bool(auth_cfg.get("cookie_secure"), False) else "never"
+        else:
+            secure_mode = "auto"
+    if secure_mode not in {"auto", "always", "never"}:
+        secure_mode = "auto"
+    session_days_value = auth_cfg.get("session_days", HOSTED_AUTH_SESSION_DAYS)
+    try:
+        session_days = max(1, int(session_days_value))
+    except (TypeError, ValueError):
+        session_days = HOSTED_AUTH_SESSION_DAYS
+    session_idle_timeout_value = auth_cfg.get("session_idle_timeout_seconds", HOSTED_AUTH_SESSION_IDLE_TIMEOUT_SECONDS)
+    try:
+        session_idle_timeout_seconds = max(300, int(session_idle_timeout_value))
+    except (TypeError, ValueError):
+        session_idle_timeout_seconds = HOSTED_AUTH_SESSION_IDLE_TIMEOUT_SECONDS
+    login_attempt_window_value = auth_cfg.get("login_attempt_window_seconds", HOSTED_AUTH_LOGIN_ATTEMPT_WINDOW_SECONDS)
+    try:
+        login_attempt_window_seconds = max(60, int(login_attempt_window_value))
+    except (TypeError, ValueError):
+        login_attempt_window_seconds = HOSTED_AUTH_LOGIN_ATTEMPT_WINDOW_SECONDS
+    login_attempt_max_failures_value = auth_cfg.get("login_attempt_max_failures", HOSTED_AUTH_LOGIN_ATTEMPT_MAX_FAILURES)
+    try:
+        login_attempt_max_failures = max(1, int(login_attempt_max_failures_value))
+    except (TypeError, ValueError):
+        login_attempt_max_failures = HOSTED_AUTH_LOGIN_ATTEMPT_MAX_FAILURES
+    return FrontendAuthConfig(
+        enabled=_parse_bool(auth_cfg.get("enabled"), False),
+        allow_registration=_parse_bool(auth_cfg.get("allow_registration"), True),
+        registration_allowlist=_parse_registration_allowlist(auth_cfg.get("registration_allowlist")),
+        cookie_name=cookie_name,
+        cookie_secure_mode=secure_mode,
+        session_days=session_days,
+        session_idle_timeout_seconds=session_idle_timeout_seconds,
+        login_attempt_window_seconds=login_attempt_window_seconds,
+        login_attempt_max_failures=login_attempt_max_failures,
+    )
+
+
+def _password_hash(password: str, salt: str, iterations: int = PASSWORD_HASH_ITERATIONS) -> str:
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("utf-8"),
+        int(iterations),
+    )
+    return base64.urlsafe_b64encode(digest).decode("ascii")
+
+
+def make_password_hash(password: str, *, iterations: int = PASSWORD_HASH_ITERATIONS) -> tuple[str, str, int]:
+    salt = secrets.token_urlsafe(16)
+    return _password_hash(password, salt, iterations), salt, int(iterations)
+
+
+def verify_password(password: str, *, password_hash: str, password_salt: str, password_iterations: int) -> bool:
+    expected = _password_hash(password, password_salt, password_iterations)
+    return hmac.compare_digest(expected, password_hash)
+
+
+def _normalize_username(value: str) -> str:
+    return db.normalize_auth_username(value)
+
+
+def _require_nonempty_password(password: str) -> str:
+    cleaned = str(password or "")
+    if len(cleaned) < 8:
+        raise ValueError("password must be at least 8 characters")
+    return cleaned
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
+def _parse_iso_datetime(value: str) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    normalized = raw.replace(" ", "T")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def _session_idle_expired(*, last_seen_at: str | None, now: datetime, idle_timeout_seconds: int) -> bool:
+    timeout_seconds = int(max(300, idle_timeout_seconds))
+    last_seen_dt = _parse_iso_datetime(str(last_seen_at or ""))
+    if last_seen_dt is None:
+        return False
+    return last_seen_dt <= (now - timedelta(seconds=timeout_seconds))
+
+
+def _session_token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _login_attempt_window_start(*, now: datetime, window_seconds: int) -> str:
+    return (now - timedelta(seconds=max(60, int(window_seconds)))).isoformat(sep=" ")
+
+
+def _raise_if_login_rate_limited(
+    conn,
+    *,
+    username: str,
+    window_seconds: int,
+    max_failures: int,
+) -> None:
+    normalized = _normalize_username(username)
+    if not normalized:
+        return
+    now = _utcnow()
+    window_start = _login_attempt_window_start(now=now, window_seconds=window_seconds)
+    failures = db.count_recent_failed_auth_login_attempts(conn, username=normalized, since_iso=window_start)
+    if failures < max_failures:
+        return
+    oldest = db.oldest_recent_failed_auth_login_attempt(conn, username=normalized, since_iso=window_start)
+    oldest_attempt = _parse_iso_datetime(str(oldest["attempted_at"])) if oldest else None
+    retry_after_seconds = max(1, int(window_seconds))
+    if oldest_attempt is not None:
+        retry_after_seconds = max(1, int((oldest_attempt + timedelta(seconds=window_seconds) - now).total_seconds()))
+    raise RateLimitError(
+        "too many failed login attempts; try again later",
+        retry_after_seconds=retry_after_seconds,
+        details={
+            "username": normalized,
+            "attempt_limit": int(max_failures),
+            "window_seconds": int(window_seconds),
+        },
+    )
+
+
+def issue_frontend_auth_session(
+    conn,
+    *,
+    user_id: int,
+    username: str,
+    display_name: str | None,
+    auth_source: str,
+    session_days: int,
+) -> FrontendAuthIssueResult:
+    session_token = secrets.token_urlsafe(32)
+    expires_at = (_utcnow() + timedelta(days=max(1, int(session_days)))).isoformat()
+    session_row = db.create_auth_session(
+        conn,
+        user_id=user_id,
+        token_hash=_session_token_hash(session_token),
+        auth_source=auth_source,
+        expires_at=expires_at,
+    )
+    return FrontendAuthIssueResult(
+        payload=FrontendAuthSession(
+            authenticated=True,
+            user_id=user_id,
+            username=username,
+            display_name=display_name,
+            session_id=int(session_row["id"]),
+            auth_source=auth_source,
+            expires_at=str(session_row["expires_at"]),
+        ),
+        session_token=session_token,
+    )
+
+
+def register_frontend_user(
+    conn,
+    *,
+    username: str,
+    password: str,
+    display_name: str | None,
+    session_days: int,
+) -> FrontendAuthIssueResult:
+    normalized = _normalize_username(username)
+    if not normalized:
+        raise ValueError("username is required")
+    if db.get_auth_user_by_username(conn, normalized) is not None:
+        raise ValueError("username already exists")
+    password_hash, password_salt, password_iterations = make_password_hash(_require_nonempty_password(password))
+    user_row = db.create_auth_user(conn, username=normalized, display_name=display_name)
+    db.upsert_auth_local_credential(
+        conn,
+        user_id=int(user_row["id"]),
+        password_hash=password_hash,
+        password_salt=password_salt,
+        password_iterations=password_iterations,
+    )
+    return issue_frontend_auth_session(
+        conn,
+        user_id=int(user_row["id"]),
+        username=str(user_row["username"]),
+        display_name=str(user_row["display_name"] or "") or None,
+        auth_source="local_password",
+        session_days=session_days,
+    )
+
+
+def login_frontend_user(
+    conn,
+    *,
+    username: str,
+    password: str,
+    session_days: int,
+    remote_addr: str | None = None,
+    login_attempt_window_seconds: int = HOSTED_AUTH_LOGIN_ATTEMPT_WINDOW_SECONDS,
+    login_attempt_max_failures: int = HOSTED_AUTH_LOGIN_ATTEMPT_MAX_FAILURES,
+) -> FrontendAuthIssueResult:
+    normalized = _normalize_username(username)
+    _raise_if_login_rate_limited(
+        conn,
+        username=normalized,
+        window_seconds=login_attempt_window_seconds,
+        max_failures=login_attempt_max_failures,
+    )
+    user_row = db.get_auth_user_by_username(conn, normalized)
+    if user_row is None:
+        db.record_auth_login_attempt(conn, username=normalized, success=False, remote_addr=remote_addr)
+        _raise_if_login_rate_limited(
+            conn,
+            username=normalized,
+            window_seconds=login_attempt_window_seconds,
+            max_failures=login_attempt_max_failures,
+        )
+        raise ValueError("invalid username or password")
+    credential = db.get_auth_local_credential(conn, int(user_row["id"]))
+    if credential is None:
+        db.record_auth_login_attempt(conn, username=normalized, success=False, remote_addr=remote_addr)
+        _raise_if_login_rate_limited(
+            conn,
+            username=normalized,
+            window_seconds=login_attempt_window_seconds,
+            max_failures=login_attempt_max_failures,
+        )
+        raise ValueError("invalid username or password")
+    if not verify_password(
+        _require_nonempty_password(password),
+        password_hash=str(credential["password_hash"]),
+        password_salt=str(credential["password_salt"]),
+        password_iterations=int(credential["password_iterations"]),
+    ):
+        db.record_auth_login_attempt(conn, username=normalized, success=False, remote_addr=remote_addr)
+        _raise_if_login_rate_limited(
+            conn,
+            username=normalized,
+            window_seconds=login_attempt_window_seconds,
+            max_failures=login_attempt_max_failures,
+        )
+        raise ValueError("invalid username or password")
+    db.record_auth_login_attempt(conn, username=normalized, success=True, remote_addr=remote_addr)
+    db.clear_auth_login_attempts(conn, username=normalized)
+    return issue_frontend_auth_session(
+        conn,
+        user_id=int(user_row["id"]),
+        username=str(user_row["username"]),
+        display_name=str(user_row["display_name"] or "") or None,
+        auth_source="local_password",
+        session_days=session_days,
+    )
+
+
+def resolve_frontend_auth_session(
+    conn,
+    *,
+    session_token: str | None,
+    session_idle_timeout_seconds: int = HOSTED_AUTH_SESSION_IDLE_TIMEOUT_SECONDS,
+) -> FrontendAuthSession:
+    token = str(session_token or "").strip()
+    if not token:
+        return FrontendAuthSession(authenticated=False)
+    row = db.get_auth_session_by_token_hash(conn, _session_token_hash(token))
+    if row is None:
+        return FrontendAuthSession(authenticated=False)
+    if row["revoked_at"]:
+        return FrontendAuthSession(authenticated=False)
+    now = _utcnow()
+    expires_at = str(row["expires_at"] or "").strip()
+    if not expires_at:
+        return FrontendAuthSession(authenticated=False)
+    expires_dt = _parse_iso_datetime(expires_at)
+    if expires_dt is None:
+        return FrontendAuthSession(authenticated=False)
+    if expires_dt <= now:
+        db.revoke_auth_session(conn, token_hash=_session_token_hash(token))
+        return FrontendAuthSession(authenticated=False)
+    if _session_idle_expired(
+        last_seen_at=str(row["last_seen_at"] or ""),
+        now=now,
+        idle_timeout_seconds=session_idle_timeout_seconds,
+    ):
+        db.revoke_auth_session(conn, token_hash=_session_token_hash(token))
+        return FrontendAuthSession(authenticated=False)
+    db.touch_auth_session(conn, token_hash=_session_token_hash(token))
+    return FrontendAuthSession(
+        authenticated=True,
+        user_id=int(row["user_id"]),
+        username=str(row["username"]),
+        display_name=str(row["display_name"] or "") or None,
+        session_id=int(row["id"]),
+        auth_source=str(row["auth_source"] or "local_password"),
+        expires_at=expires_at,
+    )
+
+
+def logout_frontend_user(conn, *, session_token: str | None) -> None:
+    token = str(session_token or "").strip()
+    if not token:
+        return
+    db.revoke_auth_session(conn, token_hash=_session_token_hash(token))
+
+
+def list_frontend_auth_sessions(
+    conn,
+    *,
+    user_id: int,
+    session_idle_timeout_seconds: int = HOSTED_AUTH_SESSION_IDLE_TIMEOUT_SECONDS,
+) -> list[dict[str, Any]]:
+    rows = db.list_auth_sessions_for_user(conn, user_id=user_id)
+    sessions: list[dict[str, Any]] = []
+    now = _utcnow()
+    for row in rows:
+        expires_at = str(row["expires_at"] or "").strip() or None
+        expired = False
+        if expires_at:
+            expires_dt = _parse_iso_datetime(expires_at)
+            expired = bool(expires_dt and expires_dt <= now)
+        idle_expired = _session_idle_expired(
+            last_seen_at=str(row["last_seen_at"] or ""),
+            now=now,
+            idle_timeout_seconds=session_idle_timeout_seconds,
+        )
+        sessions.append(
+            {
+                "session_id": int(row["id"]),
+                "auth_source": str(row["auth_source"] or "local_password"),
+                "created_at": str(row["created_at"] or ""),
+                "last_seen_at": str(row["last_seen_at"] or "") or None,
+                "expires_at": expires_at,
+                "revoked_at": str(row["revoked_at"] or "") or None,
+                "active": row["revoked_at"] is None and not expired and not idle_expired,
+                "expired": expired,
+                "idle_expired": idle_expired,
+            }
+        )
+    return sessions
+
+
+def revoke_frontend_auth_session(conn, *, user_id: int, session_id: int) -> bool:
+    return db.revoke_auth_session_by_id_for_user(conn, user_id=user_id, session_id=session_id)
+
+
+def provision_frontend_user(
+    conn,
+    *,
+    username: str,
+    password: str,
+    display_name: str | None = None,
+    reset_password: bool = False,
+) -> FrontendAuthProvisionResult:
+    normalized = _normalize_username(username)
+    if not normalized:
+        raise ValueError("username is required")
+    password_hash, password_salt, password_iterations = make_password_hash(_require_nonempty_password(password))
+    user_row = db.get_auth_user_by_username(conn, normalized)
+    created = False
+    password_updated = False
+
+    if user_row is None:
+        user_row = db.create_auth_user(conn, username=normalized, display_name=display_name)
+        created = True
+    elif display_name is not None:
+        updated_row = db.update_auth_user_display_name(conn, user_id=int(user_row["id"]), display_name=display_name)
+        if updated_row is not None:
+            user_row = updated_row
+
+    credential = db.get_auth_local_credential(conn, int(user_row["id"]))
+    if credential is not None and not reset_password:
+        raise ValueError("username already exists; pass reset_password to rotate the local password")
+
+    db.upsert_auth_local_credential(
+        conn,
+        user_id=int(user_row["id"]),
+        password_hash=password_hash,
+        password_salt=password_salt,
+        password_iterations=password_iterations,
+    )
+    password_updated = True
+    return FrontendAuthProvisionResult(
+        user_id=int(user_row["id"]),
+        username=str(user_row["username"]),
+        display_name=str(user_row["display_name"] or "") or None,
+        created=created,
+        password_updated=password_updated,
+    )

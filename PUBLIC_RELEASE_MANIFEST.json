@@ -1,0 +1,55 @@
+{
+  "builder": {
+    "name": "scripts/build_public_release_tree.sh",
+    "sha256": "5d4365959de669113e529a7b078c97b6f4ff27f37aadd9a2e2712ceeb99c7a6e"
+  },
+  "expected_validation": [
+    "candidate exclusion checks",
+    "private identifier static scan",
+    "credential-shaped static scan",
+    "compileall smoke",
+    "CLI help smoke",
+    "CLI docs generation smoke",
+    "release summary smoke",
+    "release check with --require-release-version",
+    "scanner-backed candidate audit"
+  ],
+  "generated_at": "2026-05-30T23:07:39Z",
+  "included_top_level": [
+    ".gitignore",
+    "LICENSE",
+    "README.md",
+    "RELEASE_NOTES.md",
+    "config.example.yaml",
+    "docs",
+    "frontend",
+    "manifests",
+    "pyproject.toml",
+    "scripts",
+    "slack_export.py",
+    "slack_mirror",
+    "uv.lock"
+  ],
+  "omitted_private_surfaces": [
+    "private git history",
+    "private planning documents",
+    "private runbook",
+    "repo-local agent instructions",
+    "repo-local agent skills",
+    "tenant fixtures",
+    "generated exports",
+    "rendered tenant manifests",
+    "local runtime state",
+    "local cache state",
+    "unsanitized tests",
+    "scanner reports"
+  ],
+  "product": "Slack Receipts",
+  "schema": "slack-receipts.public-release-manifest.v1",
+  "source": {
+    "commit": "c3bce6d1063bcb5de03ac5e2e3b62f45228a5d60",
+    "dirty": true,
+    "repository": "private development repository"
+  },
+  "version": "0.3.0"
+}

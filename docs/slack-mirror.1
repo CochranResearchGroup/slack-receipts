@@ -1,0 +1,1743 @@
+.TH SLACK-MIRROR 1
+.SH NAME
+slack-mirror - CLI documentation
+.SH SLACK-MIRROR
+Slack workspace mirror CLI for backfills, webhook ingest, and processing.
+**Usage**
+
+usage: slack-mirror [-h] [--version] [--config CONFIG]
+                    {mirror,workspaces,channels,messages,search,docs,completion,api,mcp,release,tenants,user-env,version}
+                    ...
+
+**Options**
+.IP \[bu] 2
+`--version` — show program's version number and exit
+.IP \[bu] 2
+`--config` — config path; if omitted, search ./config.local.yaml, ./config.yaml, then ~/.config/slack-receipts/config.yaml and legacy ~/.config/slack-mirror/config.yaml
+**Arguments**
+**Examples**
+
+slack-mirror --config config.yaml mirror init
+slack-mirror --config config.yaml workspaces list --json
+
+**Subcommands**
+.IP \[bu] 2
+`api`
+.IP \[bu] 2
+`channels`
+.IP \[bu] 2
+`completion`
+.IP \[bu] 2
+`docs`
+.IP \[bu] 2
+`mcp`
+.IP \[bu] 2
+`messages`
+.IP \[bu] 2
+`mirror`
+.IP \[bu] 2
+`release`
+.IP \[bu] 2
+`search`
+.IP \[bu] 2
+`tenants`
+.IP \[bu] 2
+`user-env`
+.IP \[bu] 2
+`version`
+.IP \[bu] 2
+`workspaces`
+.SH SLACK-MIRROR API
+**Usage**
+
+usage: slack-mirror api [-h] {serve} ...
+
+**Arguments**
+**Subcommands**
+.IP \[bu] 2
+`serve`
+.SH SLACK-MIRROR API SERVE
+**Usage**
+
+usage: slack-mirror api serve [-h] [--bind BIND] [--port PORT]
+
+**Options**
+.IP \[bu] 2
+`--bind` — bind address (defaults to config service.bind)
+.IP \[bu] 2
+`--port` — listen port (defaults to config service.port)
+.SH SLACK-MIRROR CHANNELS
+**Usage**
+
+usage: slack-mirror channels [-h] {sync-from-tool} ...
+
+**Arguments**
+**Subcommands**
+.IP \[bu] 2
+`sync-from-tool`
+.SH SLACK-MIRROR CHANNELS SYNC-FROM-TOOL
+**Usage**
+
+usage: slack-mirror channels sync-from-tool [-h] [--json]
+
+**Options**
+.IP \[bu] 2
+`--json`
+.SH SLACK-MIRROR COMPLETION
+**Usage**
+
+usage: slack-mirror completion [-h] {print} ...
+
+**Arguments**
+**Subcommands**
+.IP \[bu] 2
+`print`
+.SH SLACK-MIRROR COMPLETION PRINT
+**Usage**
+
+usage: slack-mirror completion print [-h] {bash,zsh}
+
+**Arguments**
+.IP \[bu] 2
+`shell`
+.SH SLACK-MIRROR DOCS
+**Usage**
+
+usage: slack-mirror docs [-h] {generate} ...
+
+**Arguments**
+**Subcommands**
+.IP \[bu] 2
+`generate`
+.SH SLACK-MIRROR DOCS GENERATE
+**Usage**
+
+usage: slack-mirror docs generate [-h] [--format {markdown,man}]
+                                  [--output OUTPUT]
+
+**Options**
+.IP \[bu] 2
+`--format` — default: `markdown`
+.IP \[bu] 2
+`--output`
+**Examples**
+
+slack-mirror --config config.yaml docs generate --format markdown --output docs/CLI.md
+slack-mirror --config config.yaml docs generate --format man --output docs/slack-mirror.1
+
+.SH SLACK-MIRROR MCP
+**Usage**
+
+usage: slack-mirror mcp [-h] {serve} ...
+
+**Arguments**
+**Subcommands**
+.IP \[bu] 2
+`serve`
+.SH SLACK-MIRROR MCP SERVE
+**Usage**
+
+usage: slack-mirror mcp serve [-h]
+
+.SH SLACK-MIRROR MESSAGES
+**Usage**
+
+usage: slack-mirror messages [-h]
+                             {list,permalink-resolve,repair-permalink,orphan-files,thread}
+                             ...
+
+**Arguments**
+**Subcommands**
+.IP \[bu] 2
+`list`
+.IP \[bu] 2
+`orphan-files`
+.IP \[bu] 2
+`permalink-resolve`
+.IP \[bu] 2
+`repair-permalink`
+.IP \[bu] 2
+`thread`
+.SH SLACK-MIRROR MESSAGES LIST
+**Usage**
+
+usage: slack-mirror messages list [-h] --workspace WORKSPACE [--after AFTER]
+                                  [--before BEFORE] [--channels CHANNELS]
+                                  [--limit LIMIT] [--json]
+
+**Options**
+.IP \[bu] 2
+`--workspace` — workspace name
+.IP \[bu] 2
+`--after` — minimum timestamp (inclusive)
+.IP \[bu] 2
+`--before` — maximum timestamp (inclusive)
+.IP \[bu] 2
+`--channels` — comma-separated list of channel IDs or names
+.IP \[bu] 2
+`--limit` — maximum results; default: `1000`
+.IP \[bu] 2
+`--json`
+.SH SLACK-MIRROR MESSAGES ORPHAN-FILES
+**Usage**
+
+usage: slack-mirror messages orphan-files [-h] --workspace WORKSPACE
+                                          [--file-id FILE_ID]
+                                          [--channel CHANNEL] [--limit LIMIT]
+                                          [--refresh-file-info]
+                                          [--auth-mode {bot,user}] [--json]
+
+**Options**
+.IP \[bu] 2
+`--workspace` — workspace name
+.IP \[bu] 2
+`--file-id` — optional Slack file id
+.IP \[bu] 2
+`--channel` — optional Slack channel id
+.IP \[bu] 2
+`--limit` — maximum orphan file rows to inspect; default: `50`
+.IP \[bu] 2
+`--refresh-file-info` — refresh candidate metadata with files.info
+.IP \[bu] 2
+`--auth-mode` — Slack token mode for optional files.info refresh; default: `bot`
+.IP \[bu] 2
+`--json`
+.SH SLACK-MIRROR MESSAGES PERMALINK-RESOLVE
+**Usage**
+
+usage: slack-mirror messages permalink-resolve [-h] [--json] url
+
+**Options**
+.IP \[bu] 2
+`--json`
+**Arguments**
+.IP \[bu] 2
+`url` — Slack archive permalink
+.SH SLACK-MIRROR MESSAGES REPAIR-PERMALINK
+**Usage**
+
+usage: slack-mirror messages repair-permalink [-h] [--auth-mode {bot,user}]
+                                              [--window-seconds WINDOW_SECONDS]
+                                              [--limit LIMIT] [--json]
+                                              url
+
+**Options**
+.IP \[bu] 2
+`--auth-mode` — Slack token mode for bounded read repair; default: `bot`
+.IP \[bu] 2
+`--window-seconds` — seconds before/after selected timestamp to request; default: `60`
+.IP \[bu] 2
+`--limit` — maximum returned replies to upsert; default: `200`
+.IP \[bu] 2
+`--json`
+**Arguments**
+.IP \[bu] 2
+`url` — Slack archive permalink
+.SH SLACK-MIRROR MESSAGES THREAD
+**Usage**
+
+usage: slack-mirror messages thread [-h] --workspace WORKSPACE --channel
+                                    CHANNEL --thread-ts THREAD_TS
+                                    [--selected-ts SELECTED_TS]
+                                    [--limit LIMIT]
+                                    [--max-text-chars MAX_TEXT_CHARS]
+                                    [--no-text] [--no-files] [--hydrate-files]
+                                    [--hydrate-limit HYDRATE_LIMIT]
+                                    [--process-ocr]
+                                    [--process-ocr-limit PROCESS_OCR_LIMIT]
+                                    [--include-derived-text] [--include-ocr]
+                                    [--max-derived-text-chars MAX_DERIVED_TEXT_CHARS]
+                                    [--json]
+
+**Options**
+.IP \[bu] 2
+`--workspace` — workspace name
+.IP \[bu] 2
+`--channel` — Slack channel id
+.IP \[bu] 2
+`--thread-ts` — Slack thread root timestamp
+.IP \[bu] 2
+`--selected-ts` — optional selected message timestamp
+.IP \[bu] 2
+`--limit` — maximum thread messages; default: `200`
+.IP \[bu] 2
+`--max-text-chars` — maximum text characters per message; default: `4000`
+.IP \[bu] 2
+`--no-text` — omit message text
+.IP \[bu] 2
+`--no-files` — omit Slack file artifacts from message rows
+.IP \[bu] 2
+`--hydrate-files` — download missing thread file artifacts before projecting evidence
+.IP \[bu] 2
+`--hydrate-limit` — maximum missing thread files to download; default: `25`
+.IP \[bu] 2
+`--process-ocr` — process pending OCR jobs for this thread's file artifacts before projecting evidence
+.IP \[bu] 2
+`--process-ocr-limit` — maximum pending OCR jobs for this thread to process; default: `5`
+.IP \[bu] 2
+`--include-derived-text` — include attachment-derived text status and bounded text excerpts for file artifacts
+.IP \[bu] 2
+`--include-ocr` — include OCR-derived text status and bounded text excerpts for file artifacts
+.IP \[bu] 2
+`--max-derived-text-chars` — maximum derived/OCR text characters per artifact kind; default: `4000`
+.IP \[bu] 2
+`--json`
+.SH SLACK-MIRROR MIRROR
+**Usage**
+
+usage: slack-mirror mirror [-h]
+                           {init,backfill,reconcile-files,embeddings-backfill,process-embedding-jobs,process-derived-text-jobs,drain-derived-text-jobs,derived-text-embeddings-backfill,benchmark-embeddings-backfill,rollout-plan,oauth-callback,serve-webhooks,serve-socket-mode,process-events,sync,status,daemon}
+                           ...
+
+**Arguments**
+**Subcommands**
+.IP \[bu] 2
+`backfill`
+.IP \[bu] 2
+`benchmark-embeddings-backfill`
+.IP \[bu] 2
+`daemon`
+.IP \[bu] 2
+`derived-text-embeddings-backfill`
+.IP \[bu] 2
+`drain-derived-text-jobs`
+.IP \[bu] 2
+`embeddings-backfill`
+.IP \[bu] 2
+`init`
+.IP \[bu] 2
+`oauth-callback`
+.IP \[bu] 2
+`process-derived-text-jobs`
+.IP \[bu] 2
+`process-embedding-jobs`
+.IP \[bu] 2
+`process-events`
+.IP \[bu] 2
+`reconcile-files`
+.IP \[bu] 2
+`rollout-plan`
+.IP \[bu] 2
+`serve-socket-mode`
+.IP \[bu] 2
+`serve-webhooks`
+.IP \[bu] 2
+`status`
+.IP \[bu] 2
+`sync`
+.SH SLACK-MIRROR MIRROR BACKFILL
+**Usage**
+
+usage: slack-mirror mirror backfill [-h] --workspace WORKSPACE
+                                    [--auth-mode {bot,user}]
+                                    [--include-messages] [--messages-only]
+                                    [--channels CHANNELS]
+                                    [--channel-limit CHANNEL_LIMIT]
+                                    [--oldest OLDEST] [--latest LATEST]
+                                    [--include-files]
+                                    [--file-types FILE_TYPES]
+                                    [--download-content]
+                                    [--cache-root CACHE_ROOT]
+
+**Options**
+.IP \[bu] 2
+`--workspace` — workspace name from config
+.IP \[bu] 2
+`--auth-mode` — auth guardrail mode; defaults to bot and requires explicit user override; default: `bot`
+.IP \[bu] 2
+`--include-messages` — include message history
+.IP \[bu] 2
+`--messages-only` — skip users/channels bootstrap and only backfill messages
+.IP \[bu] 2
+`--channels` — optional CSV of channel IDs for message-only pulls (avoids channels bootstrap dependency)
+.IP \[bu] 2
+`--channel-limit` — limit channels processed in this run
+.IP \[bu] 2
+`--oldest` — oldest message ts boundary (inclusive)
+.IP \[bu] 2
+`--latest` — latest message ts boundary (inclusive)
+.IP \[bu] 2
+`--include-files` — include files and canvases metadata
+.IP \[bu] 2
+`--file-types` — files.list types filter; use 'all' to fetch all non-canvas file types; default: `images,snippets,gdocs,zips,pdfs`
+.IP \[bu] 2
+`--download-content`
+.IP \[bu] 2
+`--cache-root` — override cache root (defaults to storage.cache_root from config)
+**Examples**
+
+slack-mirror --config config.yaml mirror backfill --workspace default --include-messages --channel-limit 10
+slack-mirror --config config.yaml mirror backfill --workspace default --include-files --file-types all --cache-root ./cache
+
+.SH SLACK-MIRROR MIRROR BENCHMARK-EMBEDDINGS-BACKFILL
+**Usage**
+
+usage: slack-mirror mirror benchmark-embeddings-backfill [-h] --workspace
+                                                         WORKSPACE --dataset
+                                                         DATASET
+                                                         --retrieval-profile
+                                                         RETRIEVAL_PROFILE
+                                                         [--model MODEL]
+                                                         [--json]
+
+**Options**
+.IP \[bu] 2
+`--workspace` — workspace name
+.IP \[bu] 2
+`--dataset` — JSONL benchmark dataset path
+.IP \[bu] 2
+`--retrieval-profile` — named retrieval profile from config search.retrieval_profiles
+.IP \[bu] 2
+`--model` — optional embedding model id override
+.IP \[bu] 2
+`--json` — json output
+.SH SLACK-MIRROR MIRROR DAEMON
+**Usage**
+
+usage: slack-mirror mirror daemon [-h] [--workspace WORKSPACE]
+                                  [--interval INTERVAL]
+                                  [--event-limit EVENT_LIMIT]
+                                  [--embedding-limit EMBEDDING_LIMIT]
+                                  [--model MODEL]
+                                  [--reconcile-minutes RECONCILE_MINUTES]
+                                  [--reconcile-channel-limit RECONCILE_CHANNEL_LIMIT]
+                                  [--file-reconcile-limit FILE_RECONCILE_LIMIT]
+                                  [--auth-mode {bot,user}]
+                                  [--cache-root CACHE_ROOT]
+                                  [--max-cycles MAX_CYCLES]
+
+**Options**
+.IP \[bu] 2
+`--workspace` — optional workspace name (default: all workspaces)
+.IP \[bu] 2
+`--interval` — loop interval in seconds; default: `2.0`
+.IP \[bu] 2
+`--event-limit` — default: `1000`
+.IP \[bu] 2
+`--embedding-limit` — default: `1000`
+.IP \[bu] 2
+`--model` — embedding model id; default: `local-hash-128`
+.IP \[bu] 2
+`--reconcile-minutes` — periodic reconcile cadence (0 disables); default: `30.0`
+.IP \[bu] 2
+`--reconcile-channel-limit` — default: `300`
+.IP \[bu] 2
+`--file-reconcile-limit` — maximum missing local files to download per reconcile cycle (0 disables); default: `25`
+.IP \[bu] 2
+`--auth-mode` — auth mode for reconcile backfill; default: `user`
+.IP \[bu] 2
+`--cache-root` — override file-cache root for periodic file reconciliation
+.IP \[bu] 2
+`--max-cycles`
+.SH SLACK-MIRROR MIRROR DERIVED-TEXT-EMBEDDINGS-BACKFILL
+**Usage**
+
+usage: slack-mirror mirror derived-text-embeddings-backfill
+       [-h] --workspace WORKSPACE [--retrieval-profile RETRIEVAL_PROFILE]
+       [--model MODEL] [--limit LIMIT] [--kind {attachment_text,ocr_text}]
+       [--source-kind {file,canvas}] [--order {latest,oldest}] [--json]
+
+**Options**
+.IP \[bu] 2
+`--workspace` — workspace name
+.IP \[bu] 2
+`--retrieval-profile` — named retrieval profile from config search.retrieval_profiles
+.IP \[bu] 2
+`--model` — embedding model id
+.IP \[bu] 2
+`--limit` — maximum derived-text chunks to scan; default: `500`
+.IP \[bu] 2
+`--kind` — optional derived-text kind filter
+.IP \[bu] 2
+`--source-kind` — optional source kind filter
+.IP \[bu] 2
+`--order` — scan newest derived-text rows first or oldest rows first; default: `latest`
+.IP \[bu] 2
+`--json` — json output
+.SH SLACK-MIRROR MIRROR DRAIN-DERIVED-TEXT-JOBS
+**Usage**
+
+usage: slack-mirror mirror drain-derived-text-jobs [-h]
+                                                   [--workspace WORKSPACE]
+                                                   [--all-workspaces]
+                                                   [--kind {attachment_text,ocr_text,all}]
+                                                   [--limit LIMIT]
+                                                   [--max-passes MAX_PASSES]
+                                                   [--job-timeout-seconds JOB_TIMEOUT_SECONDS]
+                                                   [--ocr-job-timeout-seconds OCR_JOB_TIMEOUT_SECONDS]
+                                                   [--max-text-chars MAX_TEXT_CHARS]
+                                                   [--json]
+
+**Options**
+.IP \[bu] 2
+`--workspace` — workspace name
+.IP \[bu] 2
+`--all-workspaces` — drain all enabled configured workspaces, falling back to DB workspaces when config has none
+.IP \[bu] 2
+`--kind` — derived-text kind to drain; default: `all`
+.IP \[bu] 2
+`--limit` — maximum jobs per processing pass; default: `100`
+.IP \[bu] 2
+`--max-passes` — maximum passes per workspace/kind before treating the queue as stalled; default: `1000`
+.IP \[bu] 2
+`--job-timeout-seconds` — maximum seconds to spend on one non-OCR extraction job; defaults to search.derived_text.job_timeout_s or 300
+.IP \[bu] 2
+`--ocr-job-timeout-seconds` — maximum seconds to spend on one OCR extraction job; defaults to --job-timeout-seconds or config default
+.IP \[bu] 2
+`--max-text-chars` — maximum extracted characters to persist for one job; defaults to search.derived_text.max_text_chars or 1000000
+.IP \[bu] 2
+`--json` — json output
+.SH SLACK-MIRROR MIRROR EMBEDDINGS-BACKFILL
+**Usage**
+
+usage: slack-mirror mirror embeddings-backfill [-h] --workspace WORKSPACE
+                                               [--retrieval-profile RETRIEVAL_PROFILE]
+                                               [--model MODEL] [--limit LIMIT]
+                                               [--channels CHANNELS]
+                                               [--oldest OLDEST]
+                                               [--latest LATEST]
+                                               [--order {latest,oldest}]
+                                               [--json]
+
+**Options**
+.IP \[bu] 2
+`--workspace` — workspace name
+.IP \[bu] 2
+`--retrieval-profile` — named retrieval profile from config search.retrieval_profiles
+.IP \[bu] 2
+`--model` — embedding model id
+.IP \[bu] 2
+`--limit` — maximum messages to scan; default: `1000`
+.IP \[bu] 2
+`--channels` — optional comma-separated channel IDs to bound the rollout; default: ``
+.IP \[bu] 2
+`--oldest` — optional oldest ts boundary (inclusive)
+.IP \[bu] 2
+`--latest` — optional latest ts boundary (inclusive)
+.IP \[bu] 2
+`--order` — scan newest messages first or oldest messages first within the bounded rollout; default: `latest`
+.IP \[bu] 2
+`--json` — json output
+.SH SLACK-MIRROR MIRROR INIT
+**Usage**
+
+usage: slack-mirror mirror init [-h]
+
+.SH SLACK-MIRROR MIRROR OAUTH-CALLBACK
+**Usage**
+
+usage: slack-mirror mirror oauth-callback [-h] --workspace WORKSPACE
+                                          [--client-id CLIENT_ID]
+                                          [--client-secret CLIENT_SECRET]
+                                          [--bind BIND] [--port PORT]
+                                          [--callback-path CALLBACK_PATH]
+                                          [--redirect-uri REDIRECT_URI]
+                                          --cert-file CERT_FILE --key-file
+                                          KEY_FILE [--scopes SCOPES]
+                                          [--user-scopes USER_SCOPES]
+                                          [--state STATE] [--timeout TIMEOUT]
+                                          [--open-browser]
+
+**Options**
+.IP \[bu] 2
+`--workspace` — workspace name from config
+.IP \[bu] 2
+`--client-id` — Slack app client ID (defaults to workspace config client_id)
+.IP \[bu] 2
+`--client-secret` — Slack app client secret (defaults to workspace config client_secret)
+.IP \[bu] 2
+`--bind` — HTTPS callback bind host; default: `localhost`
+.IP \[bu] 2
+`--port` — HTTPS callback port; default: `3000`
+.IP \[bu] 2
+`--callback-path` — OAuth callback path; default: `/slack/oauth/callback`
+.IP \[bu] 2
+`--redirect-uri` — explicit redirect URI (must match Slack app config)
+.IP \[bu] 2
+`--cert-file` — TLS cert PEM file (mkcert localhost cert)
+.IP \[bu] 2
+`--key-file` — TLS key PEM file (mkcert localhost key)
+.IP \[bu] 2
+`--scopes` — comma-separated bot scopes; default: ``
+.IP \[bu] 2
+`--user-scopes` — comma-separated user scopes; default: ``
+.IP \[bu] 2
+`--state` — optional OAuth state override
+.IP \[bu] 2
+`--timeout` — callback wait timeout in seconds; default: `180`
+.IP \[bu] 2
+`--open-browser` — open install URL automatically
+**Examples**
+
+slack-mirror --config config.yaml mirror oauth-callback --workspace default --cert-file ./localhost+2.pem --key-file ./localhost+2-key.pem --scopes chat:write,channels:history --open-browser
+
+.SH SLACK-MIRROR MIRROR PROCESS-DERIVED-TEXT-JOBS
+**Usage**
+
+usage: slack-mirror mirror process-derived-text-jobs [-h] --workspace
+                                                     WORKSPACE
+                                                     [--kind {attachment_text,ocr_text}]
+                                                     [--limit LIMIT]
+                                                     [--job-timeout-seconds JOB_TIMEOUT_SECONDS]
+                                                     [--max-text-chars MAX_TEXT_CHARS]
+
+**Options**
+.IP \[bu] 2
+`--workspace` — workspace name
+.IP \[bu] 2
+`--kind` — derived-text kind to process; default: `attachment_text`
+.IP \[bu] 2
+`--limit` — maximum jobs to process; default: `100`
+.IP \[bu] 2
+`--job-timeout-seconds` — maximum seconds to spend on one extraction job; defaults to search.derived_text.job_timeout_s or 300
+.IP \[bu] 2
+`--max-text-chars` — maximum extracted characters to persist for one job; defaults to search.derived_text.max_text_chars or 1000000
+.SH SLACK-MIRROR MIRROR PROCESS-EMBEDDING-JOBS
+**Usage**
+
+usage: slack-mirror mirror process-embedding-jobs [-h] --workspace WORKSPACE
+                                                  [--model MODEL]
+                                                  [--limit LIMIT]
+
+**Options**
+.IP \[bu] 2
+`--workspace` — workspace name
+.IP \[bu] 2
+`--model` — embedding model id; default: `local-hash-128`
+.IP \[bu] 2
+`--limit` — maximum jobs to process; default: `200`
+.SH SLACK-MIRROR MIRROR PROCESS-EVENTS
+**Usage**
+
+usage: slack-mirror mirror process-events [-h] --workspace WORKSPACE
+                                          [--limit LIMIT] [--loop]
+                                          [--interval INTERVAL]
+                                          [--max-cycles MAX_CYCLES]
+
+**Options**
+.IP \[bu] 2
+`--workspace`
+.IP \[bu] 2
+`--limit` — default: `100`
+.IP \[bu] 2
+`--loop`
+.IP \[bu] 2
+`--interval` — default: `2.0`
+.IP \[bu] 2
+`--max-cycles`
+**Examples**
+
+slack-mirror --config config.yaml mirror process-events --workspace default --limit 200
+slack-mirror --config config.yaml mirror process-events --workspace default --loop --interval 2 --max-cycles 10
+
+.SH SLACK-MIRROR MIRROR RECONCILE-FILES
+**Usage**
+
+usage: slack-mirror mirror reconcile-files [-h] --workspace WORKSPACE
+                                           [--auth-mode {bot,user}]
+                                           [--limit LIMIT]
+                                           [--cache-root CACHE_ROOT] [--json]
+
+**Options**
+.IP \[bu] 2
+`--workspace` — workspace name
+.IP \[bu] 2
+`--auth-mode` — auth mode for file download repair; default: `user`
+.IP \[bu] 2
+`--limit` — maximum file downloads to attempt in this run; default: `100`
+.IP \[bu] 2
+`--cache-root` — override cache root (defaults to storage.cache_root from config)
+.IP \[bu] 2
+`--json` — json output
+.SH SLACK-MIRROR MIRROR ROLLOUT-PLAN
+**Usage**
+
+usage: slack-mirror mirror rollout-plan [-h] --workspace WORKSPACE
+                                        --retrieval-profile RETRIEVAL_PROFILE
+                                        [--limit LIMIT] [--channels CHANNELS]
+                                        [--oldest OLDEST] [--latest LATEST]
+                                        [--kind {attachment_text,ocr_text}]
+                                        [--source-kind {file,canvas}] [--json]
+
+**Options**
+.IP \[bu] 2
+`--workspace` — workspace name
+.IP \[bu] 2
+`--retrieval-profile` — named search.retrieval_profiles profile
+.IP \[bu] 2
+`--limit` — bounded backfill limit to include in suggested commands; default: `500`
+.IP \[bu] 2
+`--channels` — optional comma-separated channel IDs to bound message rollout; default: ``
+.IP \[bu] 2
+`--oldest` — optional oldest message ts boundary
+.IP \[bu] 2
+`--latest` — optional latest message ts boundary
+.IP \[bu] 2
+`--kind` — optional derived-text kind filter
+.IP \[bu] 2
+`--source-kind` — optional derived-text source kind filter
+.IP \[bu] 2
+`--json` — json output
+.SH SLACK-MIRROR MIRROR SERVE-SOCKET-MODE
+**Usage**
+
+usage: slack-mirror mirror serve-socket-mode [-h] --workspace WORKSPACE
+
+**Options**
+.IP \[bu] 2
+`--workspace`
+**Examples**
+
+slack-mirror --config config.yaml mirror serve-socket-mode --workspace default
+
+.SH SLACK-MIRROR MIRROR SERVE-WEBHOOKS
+**Usage**
+
+usage: slack-mirror mirror serve-webhooks [-h] --workspace WORKSPACE
+                                          [--bind BIND] [--port PORT]
+
+**Options**
+.IP \[bu] 2
+`--workspace`
+.IP \[bu] 2
+`--bind`
+.IP \[bu] 2
+`--port`
+**Examples**
+
+slack-mirror --config config.yaml mirror serve-webhooks --workspace default --bind 127.0.0.1 --port 8787
+
+.SH SLACK-MIRROR MIRROR STATUS
+**Usage**
+
+usage: slack-mirror mirror status [-h] [--workspace WORKSPACE]
+                                  [--stale-hours STALE_HOURS] [--healthy]
+                                  [--fail-on-gap]
+                                  [--max-zero-msg MAX_ZERO_MSG]
+                                  [--max-stale MAX_STALE] [--enforce-stale]
+                                  [--classify-access]
+                                  [--classify-limit CLASSIFY_LIMIT] [--json]
+
+**Options**
+.IP \[bu] 2
+`--workspace` — optional workspace name
+.IP \[bu] 2
+`--stale-hours` — stale threshold in hours; default: `24.0`
+.IP \[bu] 2
+`--healthy` — emit HEALTHY/UNHEALTHY summary
+.IP \[bu] 2
+`--fail-on-gap` — exit code 2 when unhealthy
+.IP \[bu] 2
+`--max-zero-msg` — max zero-message channels allowed per row
+.IP \[bu] 2
+`--max-stale` — max stale channels allowed per row
+.IP \[bu] 2
+`--enforce-stale` — include stale threshold in health gate (default: observe stale but do not fail)
+.IP \[bu] 2
+`--classify-access` — include A/B/C access classification and C-bucket channel ids
+.IP \[bu] 2
+`--classify-limit` — max zero-message channel ids to print per workspace for classification; default: `200`
+.IP \[bu] 2
+`--json`
+.SH SLACK-MIRROR MIRROR SYNC
+**Usage**
+
+usage: slack-mirror mirror sync [-h] [--workspace WORKSPACE]
+                                [--auth-mode {bot,user}] [--include-files]
+                                [--file-types FILE_TYPES] [--download-content]
+                                [--cache-root CACHE_ROOT] [--messages-only]
+                                [--channels CHANNELS]
+                                [--channel-limit CHANNEL_LIMIT]
+                                [--oldest OLDEST] [--latest LATEST]
+                                [--refresh-embeddings] [--model MODEL]
+                                [--embedding-scan-limit EMBEDDING_SCAN_LIMIT]
+                                [--embedding-job-limit EMBEDDING_JOB_LIMIT]
+                                [--reindex-keyword]
+
+**Options**
+.IP \[bu] 2
+`--workspace` — optional workspace name (default: all workspaces)
+.IP \[bu] 2
+`--auth-mode` — auth mode for backfill; default: `user`
+.IP \[bu] 2
+`--include-files` — include files/canvases metadata
+.IP \[bu] 2
+`--file-types` — files.list types filter; default: `all`
+.IP \[bu] 2
+`--download-content` — download file/canvas content
+.IP \[bu] 2
+`--cache-root` — override cache root (defaults to storage.cache_root from config)
+.IP \[bu] 2
+`--messages-only` — skip users/channels bootstrap and pull messages only
+.IP \[bu] 2
+`--channels` — csv list of channel ids (messages-only mode)
+.IP \[bu] 2
+`--channel-limit` — cap channels processed
+.IP \[bu] 2
+`--oldest` — oldest message ts boundary (inclusive)
+.IP \[bu] 2
+`--latest` — latest message ts boundary (inclusive)
+.IP \[bu] 2
+`--refresh-embeddings` — enqueue and process embedding catch-up
+.IP \[bu] 2
+`--model` — embedding model id; default: `local-hash-128`
+.IP \[bu] 2
+`--embedding-scan-limit` — default: `50000`
+.IP \[bu] 2
+`--embedding-job-limit` — default: `5000`
+.IP \[bu] 2
+`--reindex-keyword` — rebuild FTS index after sync
+.SH SLACK-MIRROR RELEASE
+**Usage**
+
+usage: slack-mirror release [-h] {check,summary} ...
+
+**Arguments**
+**Subcommands**
+.IP \[bu] 2
+`check`
+.IP \[bu] 2
+`summary`
+.SH SLACK-MIRROR RELEASE CHECK
+**Usage**
+
+usage: slack-mirror release check [-h] [--json] [--require-clean]
+                                  [--require-release-version]
+                                  [--require-managed-runtime]
+
+**Options**
+.IP \[bu] 2
+`--json` — json output
+.IP \[bu] 2
+`--require-clean` — fail when git worktree is dirty
+.IP \[bu] 2
+`--require-release-version` — fail when pyproject version is still a development version
+.IP \[bu] 2
+`--require-managed-runtime` — fail unless the managed user runtime passes user-env check-live
+.SH SLACK-MIRROR RELEASE SUMMARY
+**Usage**
+
+usage: slack-mirror release summary [-h] [--json]
+
+**Options**
+.IP \[bu] 2
+`--json` — json output
+.SH SLACK-MIRROR SEARCH
+**Usage**
+
+usage: slack-mirror search [-h]
+                           {reindex-keyword,keyword,semantic,derived-text,corpus,context-pack,health,profile-benchmark,benchmark-validate,benchmark-diagnose,benchmark-query-variants,profiles,semantic-readiness,scale-review,provider-probe,reranker-probe,inference-serve,inference-probe,query-dir}
+                           ...
+
+**Arguments**
+**Subcommands**
+.IP \[bu] 2
+`benchmark-diagnose`
+.IP \[bu] 2
+`benchmark-query-variants`
+.IP \[bu] 2
+`benchmark-validate`
+.IP \[bu] 2
+`context-pack`
+.IP \[bu] 2
+`corpus`
+.IP \[bu] 2
+`derived-text`
+.IP \[bu] 2
+`health`
+.IP \[bu] 2
+`inference-probe`
+.IP \[bu] 2
+`inference-serve`
+.IP \[bu] 2
+`keyword`
+.IP \[bu] 2
+`profile-benchmark`
+.IP \[bu] 2
+`profiles`
+.IP \[bu] 2
+`provider-probe`
+.IP \[bu] 2
+`query-dir`
+.IP \[bu] 2
+`reindex-keyword`
+.IP \[bu] 2
+`reranker-probe`
+.IP \[bu] 2
+`scale-review`
+.IP \[bu] 2
+`semantic`
+.IP \[bu] 2
+`semantic-readiness`
+.SH SLACK-MIRROR SEARCH BENCHMARK-DIAGNOSE
+**Usage**
+
+usage: slack-mirror search benchmark-diagnose [-h] --workspace WORKSPACE
+                                              --dataset DATASET
+                                              [--profiles PROFILES]
+                                              [--limit LIMIT]
+                                              [--fusion {weighted,rrf}]
+                                              [--include-text] [--json]
+
+**Options**
+.IP \[bu] 2
+`--workspace` — workspace name
+.IP \[bu] 2
+`--dataset` — JSONL benchmark dataset path
+.IP \[bu] 2
+`--profiles` — comma-separated retrieval profile names to diagnose (default: baseline); default: `baseline`
+.IP \[bu] 2
+`--limit` — diagnostic result window; default: `10`
+.IP \[bu] 2
+`--fusion` — hybrid fusion method for corpus diagnostic results; default: `weighted`
+.IP \[bu] 2
+`--include-text` — include message text/snippets for local debugging; default output is non-content
+.IP \[bu] 2
+`--json` — json output
+.SH SLACK-MIRROR SEARCH BENCHMARK-QUERY-VARIANTS
+**Usage**
+
+usage: slack-mirror search benchmark-query-variants [-h] --workspace WORKSPACE
+                                                    --dataset DATASET
+                                                    [--profiles PROFILES]
+                                                    [--variants VARIANTS]
+                                                    [--mode {lexical,semantic,hybrid}]
+                                                    [--limit LIMIT]
+                                                    [--model MODEL]
+                                                    [--fusion {weighted,rrf}]
+                                                    [--include-details]
+                                                    [--json]
+
+**Options**
+.IP \[bu] 2
+`--workspace` — workspace name
+.IP \[bu] 2
+`--dataset` — JSONL benchmark dataset path
+.IP \[bu] 2
+`--profiles` — comma-separated retrieval profile names to benchmark (default: baseline); default: `baseline`
+.IP \[bu] 2
+`--variants` — comma-separated query variants: original, lowercase, dehyphen, alnum, dataset, or dataset:<key>; default: `original,lowercase,dehyphen,alnum`
+.IP \[bu] 2
+`--mode` — benchmark retrieval mode override
+.IP \[bu] 2
+`--limit` — benchmark result window; default: `10`
+.IP \[bu] 2
+`--model` — embedding model id override for all profiles
+.IP \[bu] 2
+`--fusion` — hybrid fusion method for corpus benchmark results; default: `weighted`
+.IP \[bu] 2
+`--include-details` — include per-query result labels; default output is aggregate-only and non-content
+.IP \[bu] 2
+`--json` — json output
+.SH SLACK-MIRROR SEARCH BENCHMARK-VALIDATE
+**Usage**
+
+usage: slack-mirror search benchmark-validate [-h] --workspace WORKSPACE
+                                              --dataset DATASET
+                                              [--profiles PROFILES]
+                                              [--include-details] [--json]
+
+**Options**
+.IP \[bu] 2
+`--workspace` — workspace name
+.IP \[bu] 2
+`--dataset` — JSONL benchmark dataset path
+.IP \[bu] 2
+`--profiles` — comma-separated retrieval profile names for model coverage checks (default: baseline); default: `baseline`
+.IP \[bu] 2
+`--include-details` — include per-query label resolution details; default output is aggregate-only
+.IP \[bu] 2
+`--json` — json output
+.SH SLACK-MIRROR SEARCH CONTEXT-PACK
+**Usage**
+
+usage: slack-mirror search context-pack [-h] --targets-json TARGETS_JSON
+                                        [--before BEFORE] [--after AFTER]
+                                        [--no-text]
+                                        [--max-text-chars MAX_TEXT_CHARS]
+                                        [--managed-export]
+                                        [--export-id EXPORT_ID]
+                                        [--title TITLE]
+                                        [--audience {local,external}] [--json]
+
+**Options**
+.IP \[bu] 2
+`--targets-json` — JSON array of action_target objects, an object with a targets array, or @path to either
+.IP \[bu] 2
+`--before` — message/chunk context items before each selected target; default: `2`
+.IP \[bu] 2
+`--after` — message/chunk context items after each selected target; default: `2`
+.IP \[bu] 2
+`--no-text` — omit message and chunk text from the context pack
+.IP \[bu] 2
+`--max-text-chars` — maximum text characters per context item; default: `4000`
+.IP \[bu] 2
+`--managed-export` — persist the context pack as a managed selected-results export
+.IP \[bu] 2
+`--export-id` — explicit export id for --managed-export
+.IP \[bu] 2
+`--title` — human title for --managed-export
+.IP \[bu] 2
+`--audience` — default link audience for --managed-export; default: `local`
+.IP \[bu] 2
+`--json` — json output
+.SH SLACK-MIRROR SEARCH CORPUS
+**Usage**
+
+usage: slack-mirror search corpus [-h]
+                                  (--workspace WORKSPACE | --all-workspaces)
+                                  --query QUERY [--limit LIMIT]
+                                  [--retrieval-profile RETRIEVAL_PROFILE]
+                                  [--mode {lexical,semantic,hybrid}]
+                                  [--model MODEL]
+                                  [--lexical-weight LEXICAL_WEIGHT]
+                                  [--semantic-weight SEMANTIC_WEIGHT]
+                                  [--semantic-scale SEMANTIC_SCALE]
+                                  [--fusion {weighted,rrf}] [--no-fts]
+                                  [--rerank] [--rerank-top-n RERANK_TOP_N]
+                                  [--kind {attachment_text,ocr_text}]
+                                  [--source-kind {file,canvas}] [--explain]
+                                  [--json]
+
+**Options**
+.IP \[bu] 2
+`--workspace` — workspace name
+.IP \[bu] 2
+`--all-workspaces` — search across all enabled workspaces
+.IP \[bu] 2
+`--query` — query text (supports message operators plus has:attachment, filename:, mime:, extension:/ext:, and attachment-type:)
+.IP \[bu] 2
+`--limit` — maximum result rows; default: `20`
+.IP \[bu] 2
+`--retrieval-profile` — named retrieval profile from config search.retrieval_profiles
+.IP \[bu] 2
+`--mode` — corpus retrieval mode
+.IP \[bu] 2
+`--model` — embedding model id
+.IP \[bu] 2
+`--lexical-weight` — hybrid lexical score weight
+.IP \[bu] 2
+`--semantic-weight` — hybrid semantic score weight
+.IP \[bu] 2
+`--semantic-scale` — semantic score scaling factor
+.IP \[bu] 2
+`--fusion` — hybrid fusion method for corpus results; default: `weighted`
+.IP \[bu] 2
+`--no-fts` — disable FTS prefilter for message lexical search
+.IP \[bu] 2
+`--rerank` — rerank the top corpus candidates
+.IP \[bu] 2
+`--rerank-top-n` — number of top corpus candidates to rerank; default: `50`
+.IP \[bu] 2
+`--kind` — optional derived-text kind filter
+.IP \[bu] 2
+`--source-kind` — optional derived-text source kind filter
+.IP \[bu] 2
+`--explain` — include score breakdown
+.IP \[bu] 2
+`--json` — json output
+.SH SLACK-MIRROR SEARCH DERIVED-TEXT
+**Usage**
+
+usage: slack-mirror search derived-text [-h] --workspace WORKSPACE --query
+                                        QUERY [--limit LIMIT]
+                                        [--mode {lexical,semantic}]
+                                        [--model MODEL]
+                                        [--kind {attachment_text,ocr_text}]
+                                        [--source-kind {file,canvas}] [--json]
+
+**Options**
+.IP \[bu] 2
+`--workspace` — workspace name
+.IP \[bu] 2
+`--query` — query text (supports has:attachment, filename:, mime:, extension:/ext:, attachment-type:, quoted phrases, and -term)
+.IP \[bu] 2
+`--limit` — maximum result rows; default: `20`
+.IP \[bu] 2
+`--mode` — derived-text retrieval mode; default: `lexical`
+.IP \[bu] 2
+`--model` — embedding model id when --mode semantic; default: `local-hash-128`
+.IP \[bu] 2
+`--kind` — optional derived-text kind filter
+.IP \[bu] 2
+`--source-kind` — optional source kind filter
+.IP \[bu] 2
+`--json` — json output
+.SH SLACK-MIRROR SEARCH HEALTH
+**Usage**
+
+usage: slack-mirror search health [-h] --workspace WORKSPACE
+                                  [--dataset DATASET]
+                                  [--target {corpus,derived_text}]
+                                  [--retrieval-profile RETRIEVAL_PROFILE]
+                                  [--mode {lexical,semantic,hybrid}]
+                                  [--limit LIMIT] [--model MODEL]
+                                  [--fusion {weighted,rrf}]
+                                  [--min-hit-at-3 MIN_HIT_AT_3]
+                                  [--min-hit-at-10 MIN_HIT_AT_10]
+                                  [--min-ndcg-at-k MIN_NDCG_AT_K]
+                                  [--max-latency-p95-ms MAX_LATENCY_P95_MS]
+                                  [--json]
+
+**Options**
+.IP \[bu] 2
+`--workspace` — workspace name
+.IP \[bu] 2
+`--dataset` — optional JSONL benchmark dataset path
+.IP \[bu] 2
+`--target` — benchmark target when dataset is provided; default: `corpus`
+.IP \[bu] 2
+`--retrieval-profile` — named retrieval profile from config search.retrieval_profiles
+.IP \[bu] 2
+`--mode` — benchmark retrieval mode
+.IP \[bu] 2
+`--limit` — benchmark result window; default: `10`
+.IP \[bu] 2
+`--model` — embedding model id for benchmark mode
+.IP \[bu] 2
+`--fusion` — hybrid fusion method for corpus benchmark results; default: `weighted`
+.IP \[bu] 2
+`--min-hit-at-3` — minimum acceptable hit@3 when dataset is provided; default: `0.5`
+.IP \[bu] 2
+`--min-hit-at-10` — minimum acceptable hit@10 when dataset is provided; default: `0.8`
+.IP \[bu] 2
+`--min-ndcg-at-k` — minimum acceptable ndcg@k when dataset is provided; default: `0.6`
+.IP \[bu] 2
+`--max-latency-p95-ms` — maximum acceptable benchmark latency p95; default: `800.0`
+.IP \[bu] 2
+`--json` — json output
+.SH SLACK-MIRROR SEARCH INFERENCE-PROBE
+**Usage**
+
+usage: slack-mirror search inference-probe [-h] [--url URL] [--model MODEL]
+                                           [--timeout TIMEOUT] [--smoke]
+                                           [--json]
+
+**Options**
+.IP \[bu] 2
+`--url` — service URL (defaults to config search.inference.url or bind/port)
+.IP \[bu] 2
+`--model` — embedding model id for smoke; default: `BAAI/bge-m3`
+.IP \[bu] 2
+`--timeout` — request timeout seconds; default: `120.0`
+.IP \[bu] 2
+`--smoke` — run embedding and rerank smoke requests
+.IP \[bu] 2
+`--json` — json output
+.SH SLACK-MIRROR SEARCH INFERENCE-SERVE
+**Usage**
+
+usage: slack-mirror search inference-serve [-h] [--bind BIND] [--port PORT]
+
+**Options**
+.IP \[bu] 2
+`--bind` — bind address (defaults to config search.inference.bind)
+.IP \[bu] 2
+`--port` — listen port (defaults to config search.inference.port)
+.SH SLACK-MIRROR SEARCH KEYWORD
+**Usage**
+
+usage: slack-mirror search keyword [-h] --workspace WORKSPACE
+                                   [--profile PROFILE] --query QUERY
+                                   [--limit LIMIT]
+                                   [--mode {lexical,semantic,hybrid}]
+                                   [--model MODEL]
+                                   [--lexical-weight LEXICAL_WEIGHT]
+                                   [--semantic-weight SEMANTIC_WEIGHT]
+                                   [--semantic-scale SEMANTIC_SCALE]
+                                   [--rank-term-weight RANK_TERM_WEIGHT]
+                                   [--rank-link-weight RANK_LINK_WEIGHT]
+                                   [--rank-thread-weight RANK_THREAD_WEIGHT]
+                                   [--rank-recency-weight RANK_RECENCY_WEIGHT]
+                                   [--group-by-thread] [--dedupe]
+                                   [--snippet-chars SNIPPET_CHARS] [--explain]
+                                   [--rerank] [--rerank-top-n RERANK_TOP_N]
+                                   [--no-fts] [--json]
+
+**Options**
+.IP \[bu] 2
+`--workspace` — workspace name
+.IP \[bu] 2
+`--profile` — named query profile from config search.query_profiles
+.IP \[bu] 2
+`--query` — query text (supports from:/participant:/user:, channel:/source:/in:, before:/after:/since:/until:/on:, is:, has:link, has:attachment, filename:, mime:, extension:/ext:, attachment-type:, quoted phrases, and -term)
+.IP \[bu] 2
+`--limit` — maximum result rows; default: `20`
+.IP \[bu] 2
+`--mode` — search retrieval mode (default from config: search.semantic.mode_default)
+.IP \[bu] 2
+`--model` — embedding model id (default from config: search.semantic.model)
+.IP \[bu] 2
+`--lexical-weight` — hybrid lexical score weight
+.IP \[bu] 2
+`--semantic-weight` — hybrid semantic score weight
+.IP \[bu] 2
+`--semantic-scale` — semantic score scaling factor
+.IP \[bu] 2
+`--rank-term-weight` — keyword ranking term-frequency weight
+.IP \[bu] 2
+`--rank-link-weight` — keyword ranking link-presence weight
+.IP \[bu] 2
+`--rank-thread-weight` — keyword ranking thread boost weight
+.IP \[bu] 2
+`--rank-recency-weight` — keyword ranking recency weight
+.IP \[bu] 2
+`--group-by-thread` — return best result per thread root
+.IP \[bu] 2
+`--dedupe` — collapse near-duplicate text results
+.IP \[bu] 2
+`--snippet-chars` — snippet length for text output; default: `280`
+.IP \[bu] 2
+`--explain` — show score/source details per result
+.IP \[bu] 2
+`--rerank` — apply optional heuristic reranking
+.IP \[bu] 2
+`--rerank-top-n` — top N rows to rerank when --rerank is enabled; default: `50`
+.IP \[bu] 2
+`--no-fts` — disable FTS prefilter and use SQL fallback only
+.IP \[bu] 2
+`--json` — json output
+**Examples**
+
+slack-mirror --config config.yaml search reindex-keyword --workspace default
+slack-mirror --config config.yaml search keyword --workspace default --query deploy --limit 20
+slack-mirror --config config.yaml search keyword --workspace default --query "release incident" --mode hybrid
+slack-mirror --config config.yaml search semantic --workspace default --query "refund issue last sprint"
+
+.SH SLACK-MIRROR SEARCH PROFILE-BENCHMARK
+**Usage**
+
+usage: slack-mirror search profile-benchmark [-h] --workspace WORKSPACE
+                                             --dataset DATASET
+                                             [--profiles PROFILES]
+                                             [--target {corpus,derived_text}]
+                                             [--mode {lexical,semantic,hybrid}]
+                                             [--limit LIMIT] [--model MODEL]
+                                             [--fusion {weighted,rrf}]
+                                             [--min-hit-at-3 MIN_HIT_AT_3]
+                                             [--min-hit-at-10 MIN_HIT_AT_10]
+                                             [--min-ndcg-at-k MIN_NDCG_AT_K]
+                                             [--max-latency-p95-ms MAX_LATENCY_P95_MS]
+                                             [--include-details] [--json]
+
+**Options**
+.IP \[bu] 2
+`--workspace` — workspace name
+.IP \[bu] 2
+`--dataset` — JSONL benchmark dataset path
+.IP \[bu] 2
+`--profiles` — comma-separated retrieval profile names to benchmark (default: baseline); default: `baseline`
+.IP \[bu] 2
+`--target` — benchmark target; default: `corpus`
+.IP \[bu] 2
+`--mode` — benchmark retrieval mode
+.IP \[bu] 2
+`--limit` — benchmark result window; default: `10`
+.IP \[bu] 2
+`--model` — embedding model id override for all profiles
+.IP \[bu] 2
+`--fusion` — hybrid fusion method for corpus benchmark results; default: `weighted`
+.IP \[bu] 2
+`--min-hit-at-3` — minimum acceptable hit@3; default: `0.5`
+.IP \[bu] 2
+`--min-hit-at-10` — minimum acceptable hit@10; default: `0.8`
+.IP \[bu] 2
+`--min-ndcg-at-k` — minimum acceptable ndcg@k; default: `0.6`
+.IP \[bu] 2
+`--max-latency-p95-ms` — maximum acceptable benchmark latency p95; default: `800.0`
+.IP \[bu] 2
+`--include-details` — include per-query benchmark details; default output is aggregate-only
+.IP \[bu] 2
+`--json` — json output
+.SH SLACK-MIRROR SEARCH PROFILES
+**Usage**
+
+usage: slack-mirror search profiles [-h] [--json]
+
+**Options**
+.IP \[bu] 2
+`--json` — json output
+.SH SLACK-MIRROR SEARCH PROVIDER-PROBE
+**Usage**
+
+usage: slack-mirror search provider-probe [-h]
+                                          [--retrieval-profile RETRIEVAL_PROFILE]
+                                          [--model MODEL] [--smoke] [--json]
+
+**Options**
+.IP \[bu] 2
+`--retrieval-profile` — named retrieval profile from config search.retrieval_profiles
+.IP \[bu] 2
+`--model` — embedding model id (defaults to config search.semantic.model)
+.IP \[bu] 2
+`--smoke` — run a small embed smoke after readiness checks
+.IP \[bu] 2
+`--json` — json output
+.SH SLACK-MIRROR SEARCH QUERY-DIR
+**Usage**
+
+usage: slack-mirror search query-dir [-h] --path PATH --query QUERY
+                                     [--mode {lexical,semantic,hybrid}]
+                                     [--glob GLOB] [--limit LIMIT] [--json]
+
+**Options**
+.IP \[bu] 2
+`--path` — root directory
+.IP \[bu] 2
+`--query` — query text
+.IP \[bu] 2
+`--mode` — default: `hybrid`
+.IP \[bu] 2
+`--glob` — file glob relative to root; default: `**/*.md`
+.IP \[bu] 2
+`--limit` — maximum result rows; default: `20`
+.IP \[bu] 2
+`--json` — json output
+.SH SLACK-MIRROR SEARCH REINDEX-KEYWORD
+**Usage**
+
+usage: slack-mirror search reindex-keyword [-h] --workspace WORKSPACE
+
+**Options**
+.IP \[bu] 2
+`--workspace` — workspace name
+.SH SLACK-MIRROR SEARCH RERANKER-PROBE
+**Usage**
+
+usage: slack-mirror search reranker-probe [-h]
+                                          [--retrieval-profile RETRIEVAL_PROFILE]
+                                          [--model MODEL] [--smoke] [--json]
+
+**Options**
+.IP \[bu] 2
+`--retrieval-profile` — named retrieval profile from config search.retrieval_profiles
+.IP \[bu] 2
+`--model` — reranker model id (defaults to config search.rerank.provider.model)
+.IP \[bu] 2
+`--smoke` — run a small rerank smoke after readiness checks
+.IP \[bu] 2
+`--json` — json output
+.SH SLACK-MIRROR SEARCH SCALE-REVIEW
+**Usage**
+
+usage: slack-mirror search scale-review [-h] --workspace WORKSPACE
+                                        [--query QUERY] [--profiles PROFILES]
+                                        [--repeats REPEATS] [--limit LIMIT]
+                                        [--fusion {weighted,rrf}] [--json]
+
+**Options**
+.IP \[bu] 2
+`--workspace` — workspace name
+.IP \[bu] 2
+`--query` — query to time; may be repeated (default: incident review); default: `[]`
+.IP \[bu] 2
+`--profiles` — comma-separated retrieval profile names to time (default: baseline); default: `baseline`
+.IP \[bu] 2
+`--repeats` — number of repeated searches per query/profile; default: `3`
+.IP \[bu] 2
+`--limit` — result window per timed search; default: `10`
+.IP \[bu] 2
+`--fusion` — hybrid fusion method for corpus results; default: `weighted`
+.IP \[bu] 2
+`--json` — json output
+.SH SLACK-MIRROR SEARCH SEMANTIC
+**Usage**
+
+usage: slack-mirror search semantic [-h] --workspace WORKSPACE
+                                    [--profile PROFILE] --query QUERY
+                                    [--limit LIMIT] [--model MODEL]
+                                    [--group-by-thread] [--dedupe]
+                                    [--snippet-chars SNIPPET_CHARS]
+                                    [--explain] [--rerank]
+                                    [--rerank-top-n RERANK_TOP_N] [--json]
+
+**Options**
+.IP \[bu] 2
+`--workspace` — workspace name
+.IP \[bu] 2
+`--profile` — named query profile from config search.query_profiles
+.IP \[bu] 2
+`--query` — semantic query text (supports from:/participant:/user:, channel:/source:/in:, before:/after:/since:/until:/on:, is:, has:link, has:attachment, filename:, mime:, extension:/ext:, attachment-type:, quoted phrases, and -term)
+.IP \[bu] 2
+`--limit` — maximum result rows; default: `20`
+.IP \[bu] 2
+`--model` — embedding model id (default from config: search.semantic.model)
+.IP \[bu] 2
+`--group-by-thread` — return best result per thread root
+.IP \[bu] 2
+`--dedupe` — collapse near-duplicate text results
+.IP \[bu] 2
+`--snippet-chars` — snippet length for text output; default: `280`
+.IP \[bu] 2
+`--explain` — show score/source details per result
+.IP \[bu] 2
+`--rerank` — apply optional heuristic reranking
+.IP \[bu] 2
+`--rerank-top-n` — top N rows to rerank when --rerank is enabled; default: `50`
+.IP \[bu] 2
+`--json` — json output
+.SH SLACK-MIRROR SEARCH SEMANTIC-READINESS
+**Usage**
+
+usage: slack-mirror search semantic-readiness [-h] [--workspace WORKSPACE]
+                                              [--profiles PROFILES]
+                                              [--include-commands]
+                                              [--command-limit COMMAND_LIMIT]
+                                              [--json]
+
+**Options**
+.IP \[bu] 2
+`--workspace` — optional workspace name; defaults to all enabled workspaces
+.IP \[bu] 2
+`--profiles` — optional comma-separated retrieval profile names; default: ``
+.IP \[bu] 2
+`--include-commands` — include rollout commands in JSON output
+.IP \[bu] 2
+`--command-limit` — bounded backfill limit for suggested commands; default: `500`
+.IP \[bu] 2
+`--json` — json output
+.SH SLACK-MIRROR TENANTS
+**Usage**
+
+usage: slack-mirror tenants [-h]
+                            {status,onboard,credentials,activate,live,backfill,retire}
+                            ...
+
+**Arguments**
+**Subcommands**
+.IP \[bu] 2
+`activate`
+.IP \[bu] 2
+`backfill`
+.IP \[bu] 2
+`credentials`
+.IP \[bu] 2
+`live`
+.IP \[bu] 2
+`onboard`
+.IP \[bu] 2
+`retire`
+.IP \[bu] 2
+`status`
+.SH SLACK-MIRROR TENANTS ACTIVATE
+**Usage**
+
+usage: slack-mirror tenants activate [-h] [--dry-run] [--skip-live-units]
+                                     [--json]
+                                     name
+
+**Options**
+.IP \[bu] 2
+`--dry-run` — validate activation readiness without writing config or starting units
+.IP \[bu] 2
+`--skip-live-units` — enable and sync config without installing live systemd units
+.IP \[bu] 2
+`--json` — json output
+**Arguments**
+.IP \[bu] 2
+`name` — local tenant/workspace name
+.SH SLACK-MIRROR TENANTS BACKFILL
+**Usage**
+
+usage: slack-mirror tenants backfill [-h] [--auth-mode {bot,user}]
+                                     [--include-messages] [--no-messages]
+                                     [--include-files]
+                                     [--channel-limit CHANNEL_LIMIT]
+                                     [--dry-run] [--json]
+                                     name
+
+**Options**
+.IP \[bu] 2
+`--auth-mode` — token mode for backfill; default: `user`
+.IP \[bu] 2
+`--include-messages` — include message history; default: `True`
+.IP \[bu] 2
+`--no-messages` — skip message history; default: `True`
+.IP \[bu] 2
+`--include-files` — include files and canvases metadata
+.IP \[bu] 2
+`--channel-limit` — bounded channel limit for browser-safe starts; default: `10`
+.IP \[bu] 2
+`--dry-run` — show command without running it
+.IP \[bu] 2
+`--json` — json output
+**Arguments**
+.IP \[bu] 2
+`name` — local tenant/workspace name
+.SH SLACK-MIRROR TENANTS CREDENTIALS
+**Usage**
+
+usage: slack-mirror tenants credentials [-h] [--credential CREDENTIAL]
+                                        [--credentials-json CREDENTIALS_JSON]
+                                        [--dry-run] [--json]
+                                        name
+
+**Options**
+.IP \[bu] 2
+`--credential` — credential assignment as field=value or ENV_VAR=value; repeatable; default: `[]`
+.IP \[bu] 2
+`--credentials-json` — JSON object of credential assignments
+.IP \[bu] 2
+`--dry-run` — validate credential install without writing dotenv
+.IP \[bu] 2
+`--json` — json output
+**Arguments**
+.IP \[bu] 2
+`name` — local tenant/workspace name
+.SH SLACK-MIRROR TENANTS LIVE
+**Usage**
+
+usage: slack-mirror tenants live [-h] [--dry-run] [--json]
+                                 name {start,restart,stop}
+
+**Options**
+.IP \[bu] 2
+`--dry-run` — show commands without running them
+.IP \[bu] 2
+`--json` — json output
+**Arguments**
+.IP \[bu] 2
+`name` — local tenant/workspace name
+.IP \[bu] 2
+`action` — live sync action
+.SH SLACK-MIRROR TENANTS ONBOARD
+**Usage**
+
+usage: slack-mirror tenants onboard [-h] --name NAME --domain DOMAIN
+                                    [--display-name DISPLAY_NAME]
+                                    [--manifest-path MANIFEST_PATH]
+                                    [--dry-run] [--no-sync] [--json]
+
+**Options**
+.IP \[bu] 2
+`--name` — local tenant/workspace name
+.IP \[bu] 2
+`--domain` — Slack workspace subdomain or https://...slack.com URL
+.IP \[bu] 2
+`--display-name` — human-facing tenant name for the Slack app manifest
+.IP \[bu] 2
+`--manifest-path` — optional rendered JSON manifest path
+.IP \[bu] 2
+`--dry-run` — show intended scaffold without writing config or manifest
+.IP \[bu] 2
+`--no-sync` — do not sync the disabled scaffold into the DB
+.IP \[bu] 2
+`--json` — json output
+.SH SLACK-MIRROR TENANTS RETIRE
+**Usage**
+
+usage: slack-mirror tenants retire [-h] --confirm CONFIRM [--delete-db]
+                                   [--keep-live-units] [--dry-run] [--json]
+                                   name
+
+**Options**
+.IP \[bu] 2
+`--confirm` — must exactly match the tenant name
+.IP \[bu] 2
+`--delete-db` — delete mirrored DB rows for this tenant
+.IP \[bu] 2
+`--keep-live-units` — do not stop live units before retiring
+.IP \[bu] 2
+`--dry-run` — show planned retirement without writing config or DB
+.IP \[bu] 2
+`--json` — json output
+**Arguments**
+.IP \[bu] 2
+`name` — local tenant/workspace name
+.SH SLACK-MIRROR TENANTS STATUS
+**Usage**
+
+usage: slack-mirror tenants status [-h] [--json] [name]
+
+**Options**
+.IP \[bu] 2
+`--json` — json output
+**Arguments**
+.IP \[bu] 2
+`name` — optional tenant/workspace name
+.SH SLACK-MIRROR USER-ENV
+**Usage**
+
+usage: slack-mirror user-env [-h]
+                             {install,update,rollback,uninstall,status,validate-live,check-live,recover-live,snapshot-report,provision-frontend-user,install-receipts-credential-aliases}
+                             ...
+
+**Arguments**
+**Subcommands**
+.IP \[bu] 2
+`check-live`
+.IP \[bu] 2
+`install`
+.IP \[bu] 2
+`install-receipts-credential-aliases`
+.IP \[bu] 2
+`provision-frontend-user`
+.IP \[bu] 2
+`recover-live`
+.IP \[bu] 2
+`rollback`
+.IP \[bu] 2
+`snapshot-report`
+.IP \[bu] 2
+`status`
+.IP \[bu] 2
+`uninstall`
+.IP \[bu] 2
+`update`
+.IP \[bu] 2
+`validate-live`
+.SH SLACK-MIRROR USER-ENV CHECK-LIVE
+**Usage**
+
+usage: slack-mirror user-env check-live [-h] [--json]
+
+**Options**
+.IP \[bu] 2
+`--json` — json output
+.SH SLACK-MIRROR USER-ENV INSTALL
+**Usage**
+
+usage: slack-mirror user-env install [-h] [--extra EXTRA]
+
+**Options**
+.IP \[bu] 2
+`--extra` — optional package extra to install into the managed venv, e.g. local-semantic; may be repeated or comma-separated; default: `[]`
+.SH SLACK-MIRROR USER-ENV INSTALL-RECEIPTS-CREDENTIAL-ALIASES
+**Usage**
+
+usage: slack-mirror user-env install-receipts-credential-aliases
+       [-h] [--dotenv DOTENV] [--dry-run]
+
+**Options**
+.IP \[bu] 2
+`--dotenv` — dotenv file to update; defaults to ~/credentials/API-keys.env
+.IP \[bu] 2
+`--dry-run` — print key names only
+.SH SLACK-MIRROR USER-ENV PROVISION-FRONTEND-USER
+**Usage**
+
+usage: slack-mirror user-env provision-frontend-user [-h] --username USERNAME
+                                                     [--display-name DISPLAY_NAME]
+                                                     [--password PASSWORD]
+                                                     [--password-env PASSWORD_ENV]
+                                                     [--reset-password]
+                                                     [--json]
+
+**Options**
+.IP \[bu] 2
+`--username` — frontend auth username or email
+.IP \[bu] 2
+`--display-name` — optional display name
+.IP \[bu] 2
+`--password` — password value (avoid shell history when possible)
+.IP \[bu] 2
+`--password-env` — read password from the named environment variable instead of prompting
+.IP \[bu] 2
+`--reset-password` — rotate the local password when the user already exists
+.IP \[bu] 2
+`--json` — json output
+.SH SLACK-MIRROR USER-ENV RECOVER-LIVE
+**Usage**
+
+usage: slack-mirror user-env recover-live [-h] [--apply] [--json]
+
+**Options**
+.IP \[bu] 2
+`--apply` — execute the safe remediations
+.IP \[bu] 2
+`--json` — json output
+.SH SLACK-MIRROR USER-ENV ROLLBACK
+**Usage**
+
+usage: slack-mirror user-env rollback [-h]
+
+.SH SLACK-MIRROR USER-ENV SNAPSHOT-REPORT
+**Usage**
+
+usage: slack-mirror user-env snapshot-report [-h] [--base-url BASE_URL]
+                                             [--name NAME] [--timeout TIMEOUT]
+                                             [--json]
+
+**Options**
+.IP \[bu] 2
+`--base-url` — base URL for the managed API; default: `http://slack.localhost`
+.IP \[bu] 2
+`--name` — snapshot report name prefix; default: `runtime-report`
+.IP \[bu] 2
+`--timeout` — request timeout in seconds; default: `5.0`
+.IP \[bu] 2
+`--json` — json output
+.SH SLACK-MIRROR USER-ENV STATUS
+**Usage**
+
+usage: slack-mirror user-env status [-h] [--json]
+
+**Options**
+.IP \[bu] 2
+`--json` — json output
+.SH SLACK-MIRROR USER-ENV UNINSTALL
+**Usage**
+
+usage: slack-mirror user-env uninstall [-h] [--purge-data]
+
+**Options**
+.IP \[bu] 2
+`--purge-data` — also remove config, DB, and cache
+.SH SLACK-MIRROR USER-ENV UPDATE
+**Usage**
+
+usage: slack-mirror user-env update [-h] [--extra EXTRA]
+
+**Options**
+.IP \[bu] 2
+`--extra` — optional package extra to install into the managed venv, e.g. local-semantic; may be repeated or comma-separated; default: `[]`
+.SH SLACK-MIRROR USER-ENV VALIDATE-LIVE
+**Usage**
+
+usage: slack-mirror user-env validate-live [-h] [--json]
+
+**Options**
+.IP \[bu] 2
+`--json` — json output
+.SH SLACK-MIRROR VERSION
+**Usage**
+
+usage: slack-mirror version [-h]
+
+.SH SLACK-MIRROR WORKSPACES
+**Usage**
+
+usage: slack-mirror workspaces [-h] {list,sync-config,verify} ...
+
+**Arguments**
+**Subcommands**
+.IP \[bu] 2
+`list`
+.IP \[bu] 2
+`sync-config`
+.IP \[bu] 2
+`verify`
+.SH SLACK-MIRROR WORKSPACES LIST
+**Usage**
+
+usage: slack-mirror workspaces list [-h] [--json]
+
+**Options**
+.IP \[bu] 2
+`--json`
+.SH SLACK-MIRROR WORKSPACES SYNC-CONFIG
+**Usage**
+
+usage: slack-mirror workspaces sync-config [-h]
+
+.SH SLACK-MIRROR WORKSPACES VERIFY
+**Usage**
+
+usage: slack-mirror workspaces verify [-h] [--workspace WORKSPACE]
+                                      [--require-explicit-outbound]
+
+**Options**
+.IP \[bu] 2
+`--workspace`
+.IP \[bu] 2
+`--require-explicit-outbound` — fail when outbound_token/outbound_user_token are not explicitly configured

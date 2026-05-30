@@ -1,0 +1,2678 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from getpass import getpass
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Sequence
+
+from slack_mirror.core.config import _resolve_dotenv_path, load_config
+from slack_mirror.service.runtime_heartbeat import heartbeat_path_for_config, load_reconcile_state
+
+
+RunFn = Callable[..., subprocess.CompletedProcess]
+PrintFn = Callable[[str], None]
+McpProbeFn = Callable[[Path], tuple[bool, str | None]]
+
+LIVE_EVENT_PENDING_FAIL_THRESHOLD = 100
+LIVE_EMBEDDING_PENDING_FAIL_THRESHOLD = 1000
+LIVE_STALE_HOURS = 24.0
+LIVE_DAEMON_HEARTBEAT_STALE_SECONDS = 10 * 60
+TERMINAL_RECONCILE_FAILURE_REASONS = {
+    # Slack can return an HTML guard/interstitial for old hosted files even
+    # when files.info succeeds; retrying the binary download will not repair it.
+    "html_interstitial",
+    "file_not_found",
+}
+
+
+def _reconcile_failure_summary(reconcile_state: dict[str, Any] | None, failed: int) -> dict[str, Any]:
+    failure_reasons_raw = (reconcile_state or {}).get("failure_reasons") or {}
+    failure_reasons: dict[str, int] = {}
+    if isinstance(failure_reasons_raw, dict):
+        for reason, count in failure_reasons_raw.items():
+            clean_reason = str(reason or "").strip()
+            if not clean_reason:
+                continue
+            try:
+                clean_count = int(count or 0)
+            except (TypeError, ValueError):
+                clean_count = 0
+            if clean_count > 0:
+                failure_reasons[clean_reason] = clean_count
+    terminal_failures = sum(
+        count for reason, count in failure_reasons.items() if reason in TERMINAL_RECONCILE_FAILURE_REASONS
+    )
+    token_scope_failures = int(failure_reasons.get("missing_scope") or 0)
+    actionable_failures = max(0, int(failed or 0) - terminal_failures - token_scope_failures)
+    return {
+        "failure_reasons": failure_reasons,
+        "terminal_failures": terminal_failures,
+        "token_scope_failures": token_scope_failures,
+        "actionable_failures": actionable_failures,
+    }
+
+
+def _config_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+@dataclass(frozen=True)
+class UserEnvPaths:
+    repo_root: Path
+    home_dir: Path
+    app_root: Path
+    app_dir: Path
+    backup_app_dir: Path
+    venv_dir: Path
+    legacy_state_dir: Path
+    state_dir: Path
+    cache_dir: Path
+    config_dir: Path
+    bin_dir: Path
+    config_path: Path
+    env_path: Path
+    wrapper_path: Path
+    api_wrapper_path: Path
+    inference_wrapper_path: Path
+    mcp_wrapper_path: Path
+    receipts_wrapper_path: Path
+    receipts_mcp_wrapper_path: Path
+    api_service_path: Path
+    inference_service_path: Path
+    snapshot_service_path: Path
+    snapshot_timer_path: Path
+
+
+@dataclass(frozen=True)
+class LiveValidationIssue:
+    severity: str
+    code: str
+    message: str
+    action: str | None = None
+    workspace: str | None = None
+
+
+@dataclass(frozen=True)
+class LiveValidationWorkspace:
+    name: str
+    event_errors: int
+    embedding_errors: int
+    event_pending: int
+    embedding_pending: int
+    daemon_heartbeat_age_seconds: float | None
+    active_recent_channels: int
+    shell_like_zero_message_channels: int
+    unexpected_empty_channels: int
+    stale_channels: int
+    stale_warning_suppressed: bool
+    reconcile_state_present: bool
+    reconcile_state_age_seconds: float | None
+    reconcile_auth_mode: str | None
+    reconcile_iso_utc: str | None
+    reconcile_attempted: int
+    reconcile_downloaded: int
+    reconcile_warnings: int
+    reconcile_failed: int
+    failure_codes: list[str]
+    warning_codes: list[str]
+    reconcile_terminal_failures: int = 0
+    reconcile_actionable_failures: int = 0
+    reconcile_token_scope_failures: int = 0
+    reconcile_failure_reasons: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class LiveValidationReport:
+    ok: bool
+    status: str
+    require_live_units: bool
+    exit_code: int
+    summary: str
+    failure_count: int
+    warning_count: int
+    failure_codes: list[str]
+    warning_codes: list[str]
+    failures: list[LiveValidationIssue]
+    warnings: list[LiveValidationIssue]
+    workspaces: list[LiveValidationWorkspace]
+
+
+@dataclass(frozen=True)
+class UserEnvStatusReport:
+    wrapper_present: bool
+    api_wrapper_present: bool
+    mcp_wrapper_present: bool
+    receipts_wrapper_present: bool
+    receipts_mcp_wrapper_present: bool
+    mcp_smoke_ok: bool
+    mcp_smoke_error: str | None
+    mcp_multi_client_ok: bool
+    mcp_multi_client_error: str | None
+    mcp_multi_client_clients: int
+    api_service_present: bool
+    snapshot_service_present: bool
+    snapshot_timer_present: bool
+    rollback_snapshot_present: bool
+    config_present: bool
+    db_present: bool
+    cache_present: bool
+    services: dict[str, str]
+    reconcile_workspaces: list[dict[str, Any]]
+    inference_wrapper_present: bool = False
+    inference_service_present: bool = False
+
+
+@dataclass(frozen=True)
+class LiveSmokeCheckReport:
+    ok: bool
+    status: str
+    exit_code: int
+    summary: str
+    failure_count: int
+    warning_count: int
+    failure_codes: list[str]
+    warning_codes: list[str]
+    failures: list[LiveValidationIssue]
+    warnings: list[LiveValidationIssue]
+    status_report: UserEnvStatusReport
+    validation_report: LiveValidationReport
+
+
+@dataclass(frozen=True)
+class LiveRecoveryAction:
+    code: str
+    description: str
+    command: list[str] | None
+    safe: bool
+    workspace: str | None = None
+
+
+@dataclass(frozen=True)
+class LiveRecoveryReport:
+    ok: bool
+    status: str
+    exit_code: int
+    applied: bool
+    summary: str
+    actionable_count: int
+    operator_only_count: int
+    action_codes: list[str]
+    operator_only_codes: list[str]
+    actions: list[LiveRecoveryAction]
+    operator_only_issues: list[LiveValidationIssue]
+    smoke_report: LiveSmokeCheckReport
+
+
+def default_user_env_paths(
+    *,
+    repo_root: Path | None = None,
+    home: Path | None = None,
+    xdg_state_home: Path | None = None,
+    xdg_cache_home: Path | None = None,
+) -> UserEnvPaths:
+    root = (repo_root or Path(__file__).resolve().parents[2]).resolve()
+    user_home = (home or Path.home()).expanduser().resolve()
+    state_home = (xdg_state_home or Path(os.environ.get("XDG_STATE_HOME", user_home / ".local" / "state"))).expanduser()
+    cache_home = (xdg_cache_home or Path(os.environ.get("XDG_CACHE_HOME", user_home / ".local" / "cache"))).expanduser()
+    app_root = user_home / ".local" / "share" / "slack-receipts"
+    config_dir = user_home / ".config" / "slack-receipts"
+    bin_dir = user_home / ".local" / "bin"
+    state_dir = state_home / "slack-receipts"
+    cache_dir = cache_home / "slack-receipts"
+    return UserEnvPaths(
+        repo_root=root,
+        home_dir=user_home,
+        app_root=app_root,
+        app_dir=app_root / "app",
+        backup_app_dir=app_root / "app.previous",
+        venv_dir=app_root / "venv",
+        legacy_state_dir=app_root / "var",
+        state_dir=state_dir,
+        cache_dir=cache_dir,
+        config_dir=config_dir,
+        bin_dir=bin_dir,
+        config_path=config_dir / "config.yaml",
+        env_path=config_dir / "env.sh",
+        wrapper_path=bin_dir / "slack-receipts-user",
+        api_wrapper_path=bin_dir / "slack-receipts-api",
+        inference_wrapper_path=bin_dir / "slack-receipts-inference",
+        mcp_wrapper_path=bin_dir / "slack-receipts-mcp",
+        receipts_wrapper_path=bin_dir / "slack-receipts-user",
+        receipts_mcp_wrapper_path=bin_dir / "slack-receipts-mcp",
+        api_service_path=user_home / ".config" / "systemd" / "user" / "slack-receipts-api.service",
+        inference_service_path=user_home / ".config" / "systemd" / "user" / "slack-receipts-inference.service",
+        snapshot_service_path=user_home / ".config" / "systemd" / "user" / "slack-receipts-runtime-report.service",
+        snapshot_timer_path=user_home / ".config" / "systemd" / "user" / "slack-receipts-runtime-report.timer",
+    )
+
+
+def _log(out: PrintFn, message: str) -> None:
+    out(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+
+
+def _mcp_frame_text(message: dict[str, Any]) -> str:
+    body = json.dumps(message, separators=(",", ":"))
+    return f"Content-Length: {len(body.encode('utf-8'))}\r\n\r\n{body}"
+
+
+def _parse_mcp_frames_text(payload: str) -> list[dict[str, Any]]:
+    frames: list[dict[str, Any]] = []
+    text = payload or ""
+    offset = 0
+    while offset < len(text):
+        separator = "\r\n\r\n"
+        header_end = text.find(separator, offset)
+        if header_end == -1:
+            separator = "\n\n"
+            header_end = text.find(separator, offset)
+        if header_end == -1:
+            break
+        header_block = text[offset:header_end]
+        match = re.search(r"(?im)^content-length:\s*(\d+)\s*$", header_block)
+        if not match:
+            break
+        content_length = int(match.group(1))
+        body_start = header_end + len(separator)
+        body = text[body_start : body_start + content_length]
+        if len(body.encode("utf-8")) != content_length:
+            break
+        frames.append(json.loads(body))
+        offset = body_start + len(body)
+    return frames
+
+
+def _probe_managed_mcp_wrapper(wrapper_path: Path) -> tuple[bool, str | None]:
+    if not wrapper_path.exists():
+        return False, "wrapper missing"
+    initialize = _mcp_frame_text({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+    health = _mcp_frame_text({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "health", "arguments": {}}})
+    try:
+        completed = subprocess.run(
+            [str(wrapper_path)],
+            input=initialize + health,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        return False, str(exc)
+    if int(completed.returncode) != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        return False, detail or f"exit code {completed.returncode}"
+    try:
+        frames = _parse_mcp_frames_text(completed.stdout or "")
+    except Exception as exc:  # pragma: no cover - defensive
+        return False, f"invalid response: {exc}"
+    if len(frames) < 2:
+        return False, "missing initialize or health response"
+    health_response = frames[-1]
+    if "error" in health_response:
+        return False, str(health_response["error"].get("message") or "health call failed")
+    result = health_response.get("result") or {}
+    content = result.get("content") or []
+    if not content:
+        return False, "missing MCP content payload"
+    try:
+        payload = json.loads(str(content[0].get("text") or "{}"))
+    except Exception as exc:  # pragma: no cover - defensive
+        return False, f"invalid MCP content payload: {exc}"
+    if payload.get("ok") is not True:
+        return False, f"unexpected health payload: {payload!r}"
+    return True, None
+
+
+def _probe_managed_mcp_wrapper_multi_client(
+    wrapper_path: Path,
+    *,
+    clients: int = 4,
+    single_client_probe: McpProbeFn = _probe_managed_mcp_wrapper,
+) -> tuple[bool, str | None]:
+    target_clients = max(1, int(clients))
+    if not wrapper_path.exists():
+        return False, "wrapper missing"
+    if target_clients == 1:
+        return single_client_probe(wrapper_path)
+
+    failures: list[str] = []
+    with ThreadPoolExecutor(max_workers=target_clients) as executor:
+        futures = [executor.submit(single_client_probe, wrapper_path) for _ in range(target_clients)]
+        for slot, future in enumerate(as_completed(futures), start=1):
+            ok, detail = future.result()
+            if not ok:
+                failures.append(f"client {slot}: {detail or 'unknown error'}")
+    if failures:
+        return False, "; ".join(failures[:3])
+    return True, None
+
+
+def _run(
+    runner: RunFn,
+    args: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    capture_output: bool = False,
+) -> subprocess.CompletedProcess:
+    completed = runner(args, check=False, text=True, env=env, capture_output=capture_output)
+    if int(completed.returncode) != 0:
+        raise RuntimeError(f"command failed ({completed.returncode}): {' '.join(args)}")
+    return completed
+
+
+def _runtime_env(paths: UserEnvPaths) -> dict[str, str]:
+    env = os.environ.copy()
+    env["HOME"] = str(paths.home_dir)
+    env["SLACK_RECEIPTS_DB"] = str(paths.state_dir / "slack_mirror.db")
+    env["SLACK_RECEIPTS_CACHE"] = str(paths.cache_dir)
+    env["SLACK_MIRROR_DB"] = str(paths.state_dir / "slack_mirror.db")
+    env["SLACK_MIRROR_CACHE"] = str(paths.cache_dir)
+    return env
+
+
+def _resolve_managed_dotenv_path(dotenv: Any, *, config_path: Path, home_dir: Path) -> Path | None:
+    original_home = os.environ.get("HOME")
+    try:
+        os.environ["HOME"] = str(home_dir)
+        return _resolve_dotenv_path(dotenv, config_path=config_path)
+    finally:
+        if original_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = original_home
+
+
+def _load_managed_config(paths: UserEnvPaths) -> Any:
+    original_receipts_db = os.environ.get("SLACK_RECEIPTS_DB")
+    original_receipts_cache = os.environ.get("SLACK_RECEIPTS_CACHE")
+    original_db = os.environ.get("SLACK_MIRROR_DB")
+    original_cache = os.environ.get("SLACK_MIRROR_CACHE")
+    original_home = os.environ.get("HOME")
+    runtime_env = _runtime_env(paths)
+    try:
+        os.environ["HOME"] = runtime_env["HOME"]
+        os.environ["SLACK_RECEIPTS_DB"] = runtime_env["SLACK_RECEIPTS_DB"]
+        os.environ["SLACK_RECEIPTS_CACHE"] = runtime_env["SLACK_RECEIPTS_CACHE"]
+        os.environ["SLACK_MIRROR_DB"] = runtime_env["SLACK_MIRROR_DB"]
+        os.environ["SLACK_MIRROR_CACHE"] = runtime_env["SLACK_MIRROR_CACHE"]
+        return load_config(paths.config_path)
+    finally:
+        if original_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = original_home
+        if original_db is None:
+            os.environ.pop("SLACK_MIRROR_DB", None)
+        else:
+            os.environ["SLACK_MIRROR_DB"] = original_db
+        if original_cache is None:
+            os.environ.pop("SLACK_MIRROR_CACHE", None)
+        else:
+            os.environ["SLACK_MIRROR_CACHE"] = original_cache
+        if original_receipts_db is None:
+            os.environ.pop("SLACK_RECEIPTS_DB", None)
+        else:
+            os.environ["SLACK_RECEIPTS_DB"] = original_receipts_db
+        if original_receipts_cache is None:
+            os.environ.pop("SLACK_RECEIPTS_CACHE", None)
+        else:
+            os.environ["SLACK_RECEIPTS_CACHE"] = original_receipts_cache
+
+
+def _ensure_dirs(paths: UserEnvPaths) -> None:
+    for path in (paths.bin_dir, paths.config_dir, paths.state_dir, paths.cache_dir):
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def _is_installable_repo_root(path: Path) -> bool:
+    return (
+        path.exists()
+        and path.is_dir()
+        and (path / "pyproject.toml").exists()
+        and (path / "config.example.yaml").exists()
+        and (path / "slack_mirror").is_dir()
+    )
+
+
+def _iter_repo_root_candidates(*roots: Path | None) -> list[Path]:
+    seen: set[Path] = set()
+    candidates: list[Path] = []
+    for root in roots:
+        if root is None:
+            continue
+        try:
+            resolved = root.expanduser().resolve()
+        except FileNotFoundError:
+            resolved = root.expanduser().absolute()
+        for candidate in [resolved, *resolved.parents]:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            candidates.append(candidate)
+    return candidates
+
+
+def _resolve_installable_repo_root(preferred_root: Path | None = None) -> Path:
+    for candidate in _iter_repo_root_candidates(
+        preferred_root,
+        Path.cwd(),
+        Path(__file__).resolve().parents[2],
+    ):
+        if _is_installable_repo_root(candidate):
+            return candidate
+    raise FileNotFoundError(
+        "Could not find an installable slack-mirror repo root. Run `slack-mirror user-env update` from the repo checkout."
+    )
+
+
+def _write_env_file(paths: UserEnvPaths) -> None:
+    paths.env_path.write_text(
+        "# Generated by slack-mirror user-env\n"
+        f'export SLACK_RECEIPTS_DB="{paths.state_dir / "slack_mirror.db"}"\n'
+        f'export SLACK_RECEIPTS_CACHE="{paths.cache_dir}"\n'
+        f'export SLACK_MIRROR_DB="{paths.state_dir / "slack_mirror.db"}"\n'
+        f'export SLACK_MIRROR_CACHE="{paths.cache_dir}"\n',
+        encoding="utf-8",
+    )
+
+
+def _ignore_repo_snapshot(_dir: str, names: list[str]) -> set[str]:
+    ignored = {".git", ".venv", ".pytest_cache", "__pycache__", "cache", "node_modules"}
+    ignored.update(name for name in names if name.startswith("localhost+") and name.endswith(".pem"))
+    return ignored.intersection(names)
+
+
+def _copy_repo_snapshot(paths: UserEnvPaths) -> None:
+    source_root = _resolve_installable_repo_root(paths.repo_root)
+    if paths.app_dir.exists():
+        shutil.rmtree(paths.app_dir)
+    shutil.copytree(source_root, paths.app_dir, ignore=_ignore_repo_snapshot)
+
+
+def _rotate_app_snapshot_backup(paths: UserEnvPaths, *, out: PrintFn) -> None:
+    if paths.backup_app_dir.exists():
+        shutil.rmtree(paths.backup_app_dir)
+    if paths.app_dir.exists():
+        _log(out, f"saving previous app snapshot: {paths.backup_app_dir}")
+        shutil.move(str(paths.app_dir), str(paths.backup_app_dir))
+
+
+def _swap_app_snapshot_with_backup(paths: UserEnvPaths, *, out: PrintFn) -> None:
+    if not paths.backup_app_dir.exists():
+        raise FileNotFoundError(f"rollback snapshot missing: {paths.backup_app_dir}")
+
+    swap_dir = paths.app_root / "app.swap"
+    if swap_dir.exists():
+        shutil.rmtree(swap_dir)
+
+    current_exists = paths.app_dir.exists()
+    if current_exists:
+        _log(out, f"parking current app snapshot: {swap_dir}")
+        shutil.move(str(paths.app_dir), str(swap_dir))
+
+    _log(out, f"restoring rollback snapshot: {paths.backup_app_dir}")
+    shutil.move(str(paths.backup_app_dir), str(paths.app_dir))
+
+    if current_exists:
+        shutil.move(str(swap_dir), str(paths.backup_app_dir))
+
+
+def _ensure_venv(
+    paths: UserEnvPaths,
+    *,
+    runner: RunFn,
+    python_executable: str | None = None,
+    out: PrintFn,
+) -> None:
+    venv_python = paths.venv_dir / "bin" / "python"
+    if not venv_python.exists():
+        python = python_executable or sys.executable or "python3"
+        _log(out, f"creating venv: {paths.venv_dir}")
+        _run(runner, [python, "-m", "venv", str(paths.venv_dir)])
+    _run(runner, [str(paths.venv_dir / "bin" / "pip"), "install", "--upgrade", "pip", "wheel", "setuptools<82"])
+
+
+def _normalise_install_extras(extras: Sequence[str] | None) -> list[str]:
+    normalised: list[str] = []
+    for raw_extra in extras or []:
+        for part in str(raw_extra).split(","):
+            extra = part.strip()
+            if extra and extra not in normalised:
+                normalised.append(extra)
+    return normalised
+
+
+def _install_python_package(paths: UserEnvPaths, *, runner: RunFn, out: PrintFn, extras: Sequence[str] | None = None) -> None:
+    install_target = str(paths.app_dir)
+    normalised_extras = _normalise_install_extras(extras)
+    if normalised_extras:
+        install_target = f"{install_target}[{','.join(normalised_extras)}]"
+        _log(out, f"installing package into venv with extras: {', '.join(normalised_extras)}")
+    else:
+        _log(out, "installing package into venv")
+    _run(runner, [str(paths.venv_dir / "bin" / "pip"), "install", "--upgrade", install_target])
+
+
+def _ensure_config(paths: UserEnvPaths, *, out: PrintFn) -> None:
+    template = paths.app_dir / "config.example.yaml"
+    if not template.exists():
+        raise FileNotFoundError(f"config template missing from app snapshot: {template}")
+    if not paths.config_path.exists():
+        _log(out, f"creating config from template: {paths.config_path}")
+        shutil.copy2(template, paths.config_path)
+    shutil.copy2(template, paths.config_dir / "config.example.latest.yaml")
+    try:
+        import yaml  # local import to avoid widening module-level dependency surface
+
+        raw = yaml.safe_load(paths.config_path.read_text(encoding="utf-8")) or {}
+    except Exception:  # pragma: no cover - defensive
+        raw = {}
+    dotenv_path = _resolve_managed_dotenv_path(raw.get("dotenv"), config_path=paths.config_path, home_dir=paths.home_dir)
+    if dotenv_path and not dotenv_path.exists():
+        dotenv_path.parent.mkdir(parents=True, exist_ok=True)
+        _log(out, f"creating managed dotenv file: {dotenv_path}")
+        dotenv_path.write_text("# Managed by slack-mirror user-env / tenants credentials\n", encoding="utf-8")
+
+
+def _dotenv_key(line: str) -> str | None:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or "=" not in stripped:
+        return None
+    if stripped.startswith("export "):
+        stripped = stripped[len("export ") :].strip()
+    key = stripped.split("=", 1)[0].strip()
+    return key or None
+
+
+def _receipts_alias_for_key(key: str) -> str | None:
+    if key.startswith("SLACK_RECEIPTS_"):
+        return None
+    if key.startswith("SLACK_MIRROR_"):
+        return "SLACK_RECEIPTS_" + key[len("SLACK_MIRROR_") :]
+    if key in {"SLACK_BOT_TOKEN", "SLACK_USER_TOKEN", "SLACK_APP_TOKEN", "SLACK_SIGNING_SECRET"}:
+        return "SLACK_RECEIPTS_" + key[len("SLACK_") :]
+    suffix_match = re.fullmatch(r"SLACK_(BOT_TOKEN|USER_TOKEN|APP_TOKEN|SIGNING_SECRET|TEAM_ID)_([A-Z0-9_]+)", key)
+    if suffix_match:
+        return f"SLACK_RECEIPTS_{suffix_match.group(1)}_{suffix_match.group(2)}"
+    workspace_match = re.fullmatch(
+        r"SLACK_([A-Z0-9]+)_(BOT_TOKEN|USER_TOKEN|APP_TOKEN|SIGNING_SECRET|TEAM_ID|WRITE_BOT_TOKEN|WRITE_USER_TOKEN)",
+        key,
+    )
+    if workspace_match:
+        return f"SLACK_RECEIPTS_{workspace_match.group(1)}_{workspace_match.group(2)}"
+    return None
+
+
+def install_slack_receipts_credential_aliases(
+    *,
+    dotenv_path: Path | None = None,
+    home: Path | None = None,
+    dry_run: bool = False,
+    out: PrintFn = print,
+) -> int:
+    user_home = (home or Path.home()).expanduser()
+    target = (dotenv_path or (user_home / "credentials" / "API-keys.env")).expanduser()
+    if not target.exists():
+        out(f"dotenv file missing: {target}")
+        return 1
+
+    lines = target.read_text(encoding="utf-8").splitlines()
+    by_key: dict[str, str] = {}
+    for line in lines:
+        key = _dotenv_key(line)
+        if key:
+            by_key[key] = line
+
+    planned: list[tuple[str, str]] = []
+    skipped: list[str] = []
+    for key in sorted(by_key):
+        alias = _receipts_alias_for_key(key)
+        if not alias:
+            continue
+        if alias in by_key:
+            skipped.append(alias)
+            continue
+        value_part = by_key[key].split("=", 1)[1]
+        planned.append((alias, value_part))
+
+    if not planned:
+        out("No Slack Receipts credential aliases needed.")
+        if skipped:
+            out("Existing aliases: " + ", ".join(sorted(skipped)))
+        return 0
+
+    out("Slack Receipts credential aliases to install:")
+    for alias, _value in planned:
+        out(f"  {alias}")
+    if skipped:
+        out("Existing aliases left unchanged:")
+        for alias in sorted(skipped):
+            out(f"  {alias}")
+
+    if dry_run:
+        out("Dry run only; no credential file changes written.")
+        return 0
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = target.with_name(f"{target.name}.bak.{timestamp}")
+    shutil.copy2(target, backup)
+    append_lines = ["", f"# Slack Receipts aliases added {timestamp}"]
+    append_lines.extend(f"{alias}={value}" for alias, value in planned)
+    target.write_text("\n".join([*lines, *append_lines, ""]), encoding="utf-8")
+    out(f"Backup written: {backup}")
+    out(f"Installed {len(planned)} Slack Receipts credential aliases.")
+    return 0
+
+
+def _migrate_legacy_state(paths: UserEnvPaths, *, out: PrintFn) -> None:
+    legacy_db = paths.legacy_state_dir / "slack_mirror.db"
+    target_db = paths.state_dir / "slack_mirror.db"
+    legacy_cache = paths.legacy_state_dir / "cache"
+
+    if not target_db.exists() and legacy_db.exists():
+        _log(out, f"migrating legacy DB into stable state dir: {target_db}")
+        shutil.copy2(legacy_db, target_db)
+
+    cache_empty = not paths.cache_dir.exists() or not any(paths.cache_dir.iterdir())
+    if cache_empty and legacy_cache.exists():
+        _log(out, f"migrating legacy cache into stable cache dir: {paths.cache_dir}")
+        paths.cache_dir.mkdir(parents=True, exist_ok=True)
+        for item in legacy_cache.iterdir():
+            dst = paths.cache_dir / item.name
+            if item.is_dir():
+                shutil.copytree(item, dst, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, dst)
+
+
+def _command_args(args: list[str]) -> str:
+    return " ".join(f'"{arg}"' for arg in args)
+
+
+def _write_wrapper(paths: UserEnvPaths, *, args: list[str], target_path: Path) -> None:
+    command = _command_args(args)
+    command_part = f" {command}" if command else ""
+    content = (
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        f'source "{paths.env_path}"\n'
+        f'exec "{paths.venv_dir / "bin" / "slack-mirror"}" --config "{paths.config_path}"{command_part} "$@"\n'
+    )
+    target_path.write_text(content, encoding="utf-8")
+    target_path.chmod(0o755)
+
+
+def _write_mcp_wrapper(paths: UserEnvPaths, *, target_path: Path) -> None:
+    content = (
+        f"#!{paths.venv_dir / 'bin' / 'python'}\n"
+        "import os\n"
+        "import sys\n"
+        "from slack_mirror.cli.main import main\n"
+        "\n"
+        f"os.environ['HOME'] = {str(paths.home_dir)!r}\n"
+        f"os.environ['SLACK_RECEIPTS_DB'] = {str(paths.state_dir / 'slack_mirror.db')!r}\n"
+        f"os.environ['SLACK_RECEIPTS_CACHE'] = {str(paths.cache_dir)!r}\n"
+        f"os.environ['SLACK_MIRROR_DB'] = {str(paths.state_dir / 'slack_mirror.db')!r}\n"
+        f"os.environ['SLACK_MIRROR_CACHE'] = {str(paths.cache_dir)!r}\n"
+        "if __name__ == '__main__':\n"
+        "    sys.argv = [\n"
+        "        sys.argv[0],\n"
+        f"        '--config', {str(paths.config_path)!r},\n"
+        "        'mcp',\n"
+        "        'serve',\n"
+        "        *sys.argv[1:],\n"
+        "    ]\n"
+        "    raise SystemExit(main())\n"
+    )
+    target_path.write_text(content, encoding="utf-8")
+    target_path.chmod(0o755)
+
+
+def _write_wrappers(paths: UserEnvPaths) -> None:
+    _write_wrapper(paths, args=[], target_path=paths.wrapper_path)
+    _write_wrapper(paths, args=["api", "serve"], target_path=paths.api_wrapper_path)
+    _write_wrapper(paths, args=["search", "inference-serve"], target_path=paths.inference_wrapper_path)
+    _write_mcp_wrapper(paths, target_path=paths.mcp_wrapper_path)
+    _write_wrapper(paths, args=[], target_path=paths.bin_dir / "slack-mirror-user")
+    _write_wrapper(paths, args=["api", "serve"], target_path=paths.bin_dir / "slack-mirror-api")
+    _write_wrapper(paths, args=["search", "inference-serve"], target_path=paths.bin_dir / "slack-mirror-inference")
+    _write_mcp_wrapper(paths, target_path=paths.bin_dir / "slack-mirror-mcp")
+
+
+def _write_api_service(paths: UserEnvPaths) -> None:
+    content = (
+        "[Unit]\n"
+        "Description=Slack Receipts API Service\n"
+        "After=network-online.target\n"
+        "Wants=network-online.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"ExecStart={paths.api_wrapper_path}\n"
+        "Restart=always\n"
+        "RestartSec=2\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+    paths.api_service_path.parent.mkdir(parents=True, exist_ok=True)
+    paths.api_service_path.write_text(content, encoding="utf-8")
+
+
+def _write_inference_service(paths: UserEnvPaths) -> None:
+    content = (
+        "[Unit]\n"
+        "Description=Slack Receipts Local Inference Service\n"
+        "After=network-online.target\n"
+        "Wants=network-online.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"ExecStart={paths.inference_wrapper_path}\n"
+        "Restart=on-failure\n"
+        "RestartSec=2\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+    paths.inference_service_path.parent.mkdir(parents=True, exist_ok=True)
+    paths.inference_service_path.write_text(content, encoding="utf-8")
+
+
+def _write_snapshot_report_units(paths: UserEnvPaths) -> None:
+    service_content = (
+        "[Unit]\n"
+        "Description=Slack Receipts Runtime Report Snapshot\n"
+        "After=network-online.target slack-receipts-api.service\n"
+        "Wants=network-online.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f"ExecStart={paths.wrapper_path} user-env snapshot-report --name scheduled-runtime-report\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+    timer_content = (
+        "[Unit]\n"
+        "Description=Slack Receipts Runtime Report Snapshot Timer\n"
+        "\n"
+        "[Timer]\n"
+        "OnBootSec=5m\n"
+        "OnUnitActiveSec=1h\n"
+        "Persistent=true\n"
+        "Unit=slack-receipts-runtime-report.service\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n"
+    )
+    paths.snapshot_service_path.parent.mkdir(parents=True, exist_ok=True)
+    paths.snapshot_service_path.write_text(service_content, encoding="utf-8")
+    paths.snapshot_timer_path.write_text(timer_content, encoding="utf-8")
+
+
+def _user_unit_path(paths: UserEnvPaths, unit_name: str) -> Path:
+    return paths.home_dir / ".config" / "systemd" / "user" / unit_name
+
+
+def _systemctl_user_env() -> dict[str, str]:
+    env = os.environ.copy()
+    runtime_dir = env.get("XDG_RUNTIME_DIR")
+    if not runtime_dir:
+        candidate = Path(f"/run/user/{os.getuid()}")
+        if candidate.exists():
+            runtime_dir = str(candidate)
+            env["XDG_RUNTIME_DIR"] = runtime_dir
+    if runtime_dir and not env.get("DBUS_SESSION_BUS_ADDRESS"):
+        bus_path = Path(runtime_dir) / "bus"
+        if bus_path.exists():
+            env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus_path}"
+    return env
+
+
+def _systemctl_state(runner: RunFn, unit_name: str) -> str:
+    completed = runner(
+        ["systemctl", "--user", "is-active", unit_name],
+        check=False,
+        text=True,
+        capture_output=True,
+        env=_systemctl_user_env(),
+    )
+    state = (completed.stdout or "").strip()
+    if state:
+        return state
+    if completed.returncode != 0:
+        return "inactive"
+    return "unknown"
+
+
+def _managed_runtime_unit_names(paths: UserEnvPaths) -> list[str]:
+    unit_dir = paths.home_dir / ".config" / "systemd" / "user"
+    names = {
+        "slack-receipts-api.service",
+        "slack-receipts-inference.service",
+        "slack-receipts-runtime-report.service",
+        "slack-receipts-runtime-report.timer",
+    }
+    if unit_dir.exists():
+        names.update(path.name for path in unit_dir.glob("slack-receipts-*.service"))
+        names.update(path.name for path in unit_dir.glob("slack-receipts-*.timer"))
+        names.update(path.name for path in unit_dir.glob("slack-mirror-*.service"))
+        names.update(path.name for path in unit_dir.glob("slack-mirror-*.timer"))
+    return sorted(names)
+
+
+def _pause_managed_runtime_for_migrations(paths: UserEnvPaths, *, runner: RunFn, out: PrintFn) -> list[str]:
+    active_units = [unit for unit in _managed_runtime_unit_names(paths) if _systemctl_state(runner, unit) == "active"]
+    if not active_units:
+        return []
+    _log(out, "pausing managed runtime units for schema migrations")
+    runner(["systemctl", "--user", "stop", *active_units], check=False, text=True)
+    return active_units
+
+
+def _restore_managed_runtime_units(units: Sequence[str], *, runner: RunFn, out: PrintFn) -> None:
+    if not units:
+        return
+    _log(out, "restoring managed runtime units after schema migrations")
+    runner(["systemctl", "--user", "start", *dict.fromkeys(units)], check=False, text=True)
+
+
+def _db_status_counts(db_path: Path, workspace: str, table: str) -> dict[str, int]:
+    conn = sqlite3.connect(db_path, timeout=10)
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT t.status, COUNT(*)
+            FROM {table} t
+            JOIN workspaces w ON w.id = t.workspace_id
+            WHERE w.name = ?
+            GROUP BY t.status
+            ORDER BY t.status
+            """,
+            (workspace,),
+        )
+        return {str(status): int(count) for status, count in rows}
+    finally:
+        conn.close()
+
+
+def _db_workspace_names(db_path: Path) -> set[str]:
+    conn = sqlite3.connect(db_path, timeout=10)
+    try:
+        rows = conn.execute("SELECT name FROM workspaces ORDER BY name")
+        return {str(name) for (name,) in rows}
+    finally:
+        conn.close()
+
+
+def _db_workspace_stale_channels(db_path: Path, workspace: str, *, stale_hours: float) -> int:
+    stale_cutoff_ts = time.time() - (float(stale_hours) * 3600.0)
+    conn = sqlite3.connect(db_path, timeout=10)
+    try:
+        row = conn.execute(
+            """
+            WITH last_msg AS (
+              SELECT workspace_id, channel_id, max(cast(ts as real)) AS max_ts
+              FROM messages
+              GROUP BY workspace_id, channel_id
+            )
+            SELECT sum(case when lm.max_ts is not null and lm.max_ts < ? then 1 else 0 end) AS stale_channels
+            FROM channels c
+            JOIN workspaces w ON w.id = c.workspace_id
+            LEFT JOIN last_msg lm ON lm.workspace_id = c.workspace_id AND lm.channel_id = c.channel_id
+            WHERE w.name = ?
+            """,
+            (stale_cutoff_ts, workspace),
+        ).fetchone()
+        return int((row[0] if row and row[0] is not None else 0))
+    finally:
+        conn.close()
+
+
+def _db_workspace_access_summary(db_path: Path, workspace: str, *, stale_hours: float) -> dict[str, int]:
+    stale_cutoff_ts = time.time() - (float(stale_hours) * 3600.0)
+    conn = sqlite3.connect(db_path, timeout=10)
+    try:
+        row = conn.execute(
+            """
+            WITH last_msg AS (
+              SELECT workspace_id, channel_id, max(cast(ts as real)) AS max_ts, count(*) AS msg_count
+              FROM messages
+              GROUP BY workspace_id, channel_id
+            )
+            SELECT
+              sum(case when coalesce(lm.msg_count,0)>0 and lm.max_ts >= ? then 1 else 0 end) as active_recent_channels,
+              sum(case when coalesce(lm.msg_count,0)=0 and (c.is_im=1 or c.is_mpim=1) then 1 else 0 end) as shell_like_zero_message_channels,
+              sum(case when coalesce(lm.msg_count,0)=0 and c.is_im=0 and c.is_mpim=0 then 1 else 0 end) as unexpected_empty_channels
+            FROM channels c
+            JOIN workspaces w ON w.id = c.workspace_id
+            LEFT JOIN last_msg lm ON lm.workspace_id = c.workspace_id AND lm.channel_id = c.channel_id
+            WHERE w.name = ?
+            """,
+            (stale_cutoff_ts, workspace),
+        ).fetchone()
+        return {
+            "active_recent_channels": int((row[0] if row and row[0] is not None else 0)),
+            "shell_like_zero_message_channels": int((row[1] if row and row[1] is not None else 0)),
+            "unexpected_empty_channels": int((row[2] if row and row[2] is not None else 0)),
+        }
+    finally:
+        conn.close()
+
+
+def _heartbeat_age_seconds(config_path: Path, workspace: str, *, kind: str) -> float | None:
+    path = heartbeat_path_for_config(str(config_path), workspace=workspace, kind=kind)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    try:
+        ts = float(payload.get("ts"))
+    except (TypeError, ValueError):
+        return None
+    age = time.time() - ts
+    return max(age, 0.0)
+
+
+def _build_live_validation_report(
+    *,
+    paths: UserEnvPaths | None = None,
+    runner: RunFn = subprocess.run,
+    require_live_units: bool = True,
+    require_workspace_credentials: bool = True,
+) -> LiveValidationReport:
+    target = paths or default_user_env_paths()
+    failures: list[LiveValidationIssue] = []
+    warnings: list[LiveValidationIssue] = []
+    workspace_reports: list[LiveValidationWorkspace] = []
+
+    def fail(code: str, message: str, action: str | None = None, *, workspace: str | None = None) -> None:
+        failures.append(LiveValidationIssue("fail", code, message, action=action, workspace=workspace))
+
+    def warn(code: str, message: str, action: str | None = None, *, workspace: str | None = None) -> None:
+        warnings.append(LiveValidationIssue("warn", code, message, action=action, workspace=workspace))
+
+    if not target.config_path.exists():
+        fail(
+            "CONFIG_MISSING",
+            "managed config is missing",
+            "run `slack-receipts user-env install` or restore ~/.config/slack-receipts/config.yaml",
+        )
+        return _finalize_live_validation_report(
+            failures=failures,
+            warnings=warnings,
+            require_live_units=require_live_units,
+            workspaces=workspace_reports,
+        )
+
+    try:
+        cfg = _load_managed_config(target)
+    except Exception as exc:
+        fail(
+            "CONFIG_INVALID",
+            f"managed config could not be loaded: {exc}",
+            "fix the config or dotenv path, then rerun `slack-mirror user-env validate-live`",
+        )
+        return _finalize_live_validation_report(
+            failures=failures,
+            warnings=warnings,
+            require_live_units=require_live_units,
+            workspaces=workspace_reports,
+        )
+
+    db_path = Path(str(cfg.get("storage", {}).get("db_path", target.state_dir / "slack_mirror.db"))).expanduser()
+    auth_cfg = (cfg.get("service", {}) or {}).get("auth", {}) or {}
+    auth_enabled = _config_bool(auth_cfg.get("enabled"), False)
+    auth_allow_registration = _config_bool(auth_cfg.get("allow_registration"), True)
+    auth_registration_allowlist = auth_cfg.get("registration_allowlist") or []
+    external_base_url = str((cfg.get("exports", {}) or {}).get("external_base_url") or "").strip()
+    if not db_path.exists():
+        fail(
+            "DB_MISSING",
+            "managed DB is missing",
+            "run `slack-mirror user-env install` or `slack-mirror-user mirror init && slack-mirror-user workspaces sync-config`",
+        )
+        return _finalize_live_validation_report(
+            failures=failures,
+            warnings=warnings,
+            require_live_units=require_live_units,
+            workspaces=workspace_reports,
+        )
+
+    workspace_configs = [ws for ws in cfg.get("workspaces", []) if ws.get("name") and ws.get("enabled", True)]
+    if not workspace_configs:
+        fail(
+            "WORKSPACE_CONFIG",
+            "no enabled workspaces found in managed config",
+            "add at least one enabled workspace to config.yaml and rerun workspace sync",
+        )
+        return _finalize_live_validation_report(
+            failures=failures,
+            warnings=warnings,
+            require_live_units=require_live_units,
+            workspaces=workspace_reports,
+        )
+
+    api_unit = "slack-receipts-api.service"
+    if not target.api_service_path.exists():
+        fail(
+            "API_UNIT_MISSING",
+            f"{api_unit} unit file missing",
+            "run `slack-mirror user-env update` to recreate the managed API service",
+        )
+    api_state = _systemctl_state(runner, api_unit)
+    if api_state != "active":
+        fail(
+            "API_UNIT_INACTIVE",
+            f"{api_unit} state={api_state}",
+            f"run `systemctl --user restart {api_unit}` and inspect `journalctl --user -u {api_unit} -n 50`",
+        )
+
+    if auth_enabled and auth_allow_registration and external_base_url:
+        allowlisted = bool(auth_registration_allowlist)
+        registration_mode = "allowlisted" if allowlisted else "open"
+        warn(
+            "AUTH_REGISTRATION_EXTERNAL",
+            (
+                f"frontend auth self-registration is {registration_mode} while external publishing is configured "
+                f"({external_base_url})"
+            ),
+            "disable `service.auth.allow_registration` after initial bootstrap unless ongoing browser self-registration is intentional",
+        )
+
+    try:
+        db_workspaces = _db_workspace_names(db_path)
+    except sqlite3.DatabaseError as exc:
+        fail(
+            "DB_UNREADABLE",
+            f"managed DB unreadable: {exc}",
+            "inspect the DB path in config, then rerun `slack-mirror-user mirror init` if schema repair is needed",
+        )
+        return _finalize_live_validation_report(
+            failures=failures,
+            warnings=warnings,
+            require_live_units=require_live_units,
+            workspaces=workspace_reports,
+        )
+
+    for ws in workspace_configs:
+        name = str(ws.get("name"))
+        ws_failures: list[str] = []
+        ws_warnings: list[str] = []
+
+        def ws_fail(code: str, message: str, action: str | None = None) -> None:
+            ws_failures.append(code)
+            fail(code, message, action, workspace=name)
+
+        def ws_warn(code: str, message: str, action: str | None = None) -> None:
+            ws_warnings.append(code)
+            warn(code, message, action, workspace=name)
+
+        if name not in db_workspaces:
+            ws_fail(
+                "WORKSPACE_DB_MISSING",
+                f"workspace {name} missing from DB",
+                f"run `slack-mirror-user workspaces sync-config` for workspace `{name}`",
+            )
+
+        outbound_token = ws.get("outbound_token") or ws.get("write_token")
+        outbound_user_token = ws.get("outbound_user_token") or ws.get("write_user_token")
+        if require_workspace_credentials:
+            if not outbound_token:
+                ws_fail(
+                    "OUTBOUND_TOKEN_MISSING",
+                    f"workspace {name} missing explicit outbound bot token",
+                    f"set `outbound_token` or `write_token` for workspace `{name}`",
+                )
+            if ws.get("user_token") and not outbound_user_token:
+                ws_fail(
+                    "OUTBOUND_USER_TOKEN_MISSING",
+                    f"workspace {name} missing explicit outbound user token",
+                    f"set `outbound_user_token` or `write_user_token` for workspace `{name}`",
+                )
+
+        receiver_unit = f"slack-receipts-webhooks-{name}.service"
+        daemon_unit = f"slack-receipts-daemon-{name}.service"
+        if require_live_units:
+            for unit_name in (receiver_unit, daemon_unit):
+                unit_path = _user_unit_path(target, unit_name)
+                if not unit_path.exists():
+                    ws_fail(
+                        "LIVE_UNIT_MISSING",
+                        f"{unit_name} unit file missing",
+                        f"run `scripts/install_live_mode_systemd_user.sh {name}` or reinstall the managed live stack",
+                    )
+                unit_state = _systemctl_state(runner, unit_name)
+                if unit_state != "active":
+                    ws_fail(
+                        "LIVE_UNIT_INACTIVE",
+                        f"{unit_name} state={unit_state}",
+                        f"run `systemctl --user restart {receiver_unit} {daemon_unit}` and inspect `journalctl --user -u {receiver_unit} -u {daemon_unit} -n 50`",
+                    )
+
+            for unit_name in (
+                f"slack-receipts-events-{name}.service",
+                f"slack-receipts-embeddings-{name}.service",
+                f"slack-mirror-events-{name}.service",
+                f"slack-mirror-embeddings-{name}.service",
+            ):
+                if _systemctl_state(runner, unit_name) == "active":
+                    ws_fail(
+                        "DUPLICATE_TOPOLOGY",
+                        f"duplicate topology active: {unit_name}",
+                        f"run `systemctl --user disable --now {unit_name}` to keep only the unified daemon topology for `{name}`",
+                    )
+
+            daemon_heartbeat_age = _heartbeat_age_seconds(target.config_path, name, kind="daemon")
+            if daemon_heartbeat_age is None:
+                ws_fail(
+                    "DAEMON_HEARTBEAT_MISSING",
+                    f"workspace {name} has no recent daemon heartbeat record",
+                    f"run `systemctl --user restart {daemon_unit}` and confirm `{daemon_unit}` is writing heartbeat state under the managed DB directory",
+                )
+            elif daemon_heartbeat_age > LIVE_DAEMON_HEARTBEAT_STALE_SECONDS:
+                ws_fail(
+                    "DAEMON_HEARTBEAT_STALE",
+                    (
+                        f"workspace {name} daemon heartbeat is stale at {int(daemon_heartbeat_age)}s "
+                        f"(threshold {LIVE_DAEMON_HEARTBEAT_STALE_SECONDS}s)"
+                    ),
+                    f"run `systemctl --user restart {daemon_unit}` and inspect `journalctl --user -u {daemon_unit} -n 50`",
+                )
+        else:
+            daemon_heartbeat_age = None
+
+        try:
+            event_counts = _db_status_counts(db_path, name, "events")
+            embedding_counts = _db_status_counts(db_path, name, "embedding_jobs")
+        except sqlite3.DatabaseError as exc:
+            ws_fail(
+                "QUEUE_INSPECTION_FAILED",
+                f"workspace {name} queue inspection failed: {exc}",
+                f"inspect `{db_path}` and rerun `slack-mirror user-env validate-live` after DB health is restored",
+            )
+            workspace_reports.append(
+                LiveValidationWorkspace(
+                    name=name,
+                    event_errors=0,
+                    embedding_errors=0,
+                    event_pending=0,
+                    embedding_pending=0,
+                    daemon_heartbeat_age_seconds=daemon_heartbeat_age,
+                    active_recent_channels=0,
+                    shell_like_zero_message_channels=0,
+                    unexpected_empty_channels=0,
+                    stale_channels=0,
+                    stale_warning_suppressed=False,
+                    reconcile_state_present=False,
+                    reconcile_state_age_seconds=None,
+                    reconcile_auth_mode=None,
+                    reconcile_iso_utc=None,
+                    reconcile_attempted=0,
+                    reconcile_downloaded=0,
+                    reconcile_warnings=0,
+                    reconcile_failed=0,
+                    reconcile_terminal_failures=0,
+                    reconcile_actionable_failures=0,
+                    reconcile_token_scope_failures=0,
+                    reconcile_failure_reasons={},
+                    failure_codes=ws_failures,
+                    warning_codes=ws_warnings,
+                )
+            )
+            continue
+
+        event_errors = event_counts.get("error", 0)
+        embedding_errors = embedding_counts.get("error", 0)
+        event_pending = event_counts.get("pending", 0)
+        embedding_pending = embedding_counts.get("pending", 0)
+        try:
+            stale_channels = _db_workspace_stale_channels(db_path, name, stale_hours=LIVE_STALE_HOURS)
+            access_summary = _db_workspace_access_summary(db_path, name, stale_hours=LIVE_STALE_HOURS)
+        except sqlite3.DatabaseError as exc:
+            ws_fail(
+                "FRESHNESS_INSPECTION_FAILED",
+                f"workspace {name} freshness inspection failed: {exc}",
+                f"inspect `{db_path}` and rerun `slack-mirror user-env validate-live` after DB health is restored",
+            )
+            stale_channels = 0
+            access_summary = {
+                "active_recent_channels": 0,
+                "shell_like_zero_message_channels": 0,
+                "unexpected_empty_channels": 0,
+            }
+
+        reconcile_state = load_reconcile_state(target.config_path, workspace=name, auth_mode="user")
+        reconcile_state_present = reconcile_state is not None
+        reconcile_state_age_seconds: float | None = None
+        reconcile_iso_utc: str | None = None
+        reconcile_attempted = 0
+        reconcile_downloaded = 0
+        reconcile_warnings = 0
+        reconcile_failed = 0
+        terminal_failures = 0
+        retryable_failed = 0
+        missing_scope_failures = 0
+        failure_reasons: dict[str, int] = {}
+        if reconcile_state:
+            reconcile_ts = reconcile_state.get("ts")
+            if reconcile_ts is not None:
+                try:
+                    reconcile_state_age_seconds = max(0.0, time.time() - float(reconcile_ts))
+                except (TypeError, ValueError):
+                    reconcile_state_age_seconds = None
+            reconcile_iso_utc = str(reconcile_state.get("iso_utc") or "") or None
+            reconcile_attempted = int(reconcile_state.get("attempted") or 0)
+            reconcile_downloaded = int(reconcile_state.get("downloaded") or 0)
+            reconcile_warnings = int(reconcile_state.get("warnings") or 0)
+            reconcile_failed = int(reconcile_state.get("failed") or 0)
+            failure_summary = _reconcile_failure_summary(reconcile_state, reconcile_failed)
+            failure_reasons = failure_summary["failure_reasons"]
+            terminal_failures = int(failure_summary["terminal_failures"])
+            missing_scope_failures = int(failure_summary["token_scope_failures"])
+            retryable_failed = int(failure_summary["actionable_failures"])
+            if missing_scope_failures:
+                ws_warn(
+                    "RECONCILE_TOKEN_SCOPE_FAILURES",
+                    f"workspace {name} last reconcile-files run had {missing_scope_failures} token-scope failures",
+                    (
+                        f"reinstall or refresh the Slack user token for `{name}` with `files:read`, then rerun "
+                        f"`slack-mirror --config {target.config_path} mirror reconcile-files --workspace {name} --auth-mode user --json`"
+                    ),
+                )
+            if retryable_failed:
+                ws_warn(
+                    "RECONCILE_REPAIR_FAILURES",
+                    f"workspace {name} last reconcile-files run had {retryable_failed} repairable failures",
+                    (
+                        f"inspect `{target.state_dir / 'reconcile-state' / f'reconcile-files-{name}-user.json'}` "
+                        f"or rerun `slack-mirror --config {target.config_path} mirror reconcile-files --workspace {name} --auth-mode user --json`"
+                    ),
+                )
+            elif reconcile_warnings:
+                ws_warn(
+                    "RECONCILE_REPAIR_WARNINGS",
+                    f"workspace {name} last reconcile-files run had {reconcile_warnings} warnings",
+                    (
+                        f"inspect `{target.state_dir / 'reconcile-state' / f'reconcile-files-{name}-user.json'}` "
+                        f"or rerun `slack-mirror --config {target.config_path} mirror reconcile-files --workspace {name} --auth-mode user --json`"
+                    ),
+                )
+
+        if event_errors:
+            handler = ws_fail if require_live_units else ws_warn
+            handler(
+                "EVENT_ERRORS",
+                f"workspace {name} has event errors: {event_errors}",
+                f"inspect `journalctl --user -u {receiver_unit} -u {daemon_unit} -n 50` and replay or clear failed event rows if needed",
+            )
+        if embedding_errors:
+            handler = ws_fail if require_live_units else ws_warn
+            handler(
+                "EMBEDDING_ERRORS",
+                f"workspace {name} has embedding job errors: {embedding_errors}",
+                f"inspect daemon logs and replay or clear failed embedding jobs for workspace `{name}`",
+            )
+
+        if require_live_units and event_pending > LIVE_EVENT_PENDING_FAIL_THRESHOLD:
+            ws_fail(
+                "EVENT_BACKLOG",
+                f"workspace {name} pending event backlog is {event_pending} (threshold {LIVE_EVENT_PENDING_FAIL_THRESHOLD})",
+                f"inspect `journalctl --user -u {receiver_unit} -u {daemon_unit} -n 50` and confirm the daemon is draining events for `{name}`",
+            )
+        elif event_pending:
+            ws_warn(
+                "EVENT_PENDING",
+                f"workspace {name} has pending events: {event_pending}",
+                f"watch the queue and rerun `slack-mirror user-env validate-live` if it does not drain for `{name}`",
+            )
+
+        if require_live_units and embedding_pending > LIVE_EMBEDDING_PENDING_FAIL_THRESHOLD:
+            ws_fail(
+                "EMBEDDING_BACKLOG",
+                f"workspace {name} pending embedding backlog is {embedding_pending} (threshold {LIVE_EMBEDDING_PENDING_FAIL_THRESHOLD})",
+                f"inspect daemon logs and embedding throughput for workspace `{name}`",
+            )
+        elif embedding_pending:
+            ws_warn(
+                "EMBEDDING_PENDING",
+                f"workspace {name} has pending embedding jobs: {embedding_pending}",
+                f"watch embedding queue drain and rerun validation if backlog persists for `{name}`",
+            )
+
+        stale_warning_suppressed = False
+        if stale_channels:
+            if require_live_units and access_summary["unexpected_empty_channels"] == 0:
+                stale_warning_suppressed = True
+            else:
+                ws_warn(
+                    "STALE_MIRROR",
+                    f"workspace {name} has {stale_channels} stale mirrored channels older than {LIVE_STALE_HOURS:g}h",
+                    (
+                        f"inspect `slack-mirror --config {target.config_path} mirror status --workspace {name} "
+                        f"--healthy --enforce-stale --stale-hours {LIVE_STALE_HOURS:g} --classify-access` "
+                        "to distinguish quiet channels from real mirror gaps"
+                    ),
+                )
+
+        workspace_reports.append(
+            LiveValidationWorkspace(
+                name=name,
+                event_errors=event_errors,
+                embedding_errors=embedding_errors,
+                event_pending=event_pending,
+                embedding_pending=embedding_pending,
+                daemon_heartbeat_age_seconds=daemon_heartbeat_age,
+                active_recent_channels=access_summary["active_recent_channels"],
+                shell_like_zero_message_channels=access_summary["shell_like_zero_message_channels"],
+                unexpected_empty_channels=access_summary["unexpected_empty_channels"],
+                stale_channels=stale_channels,
+                stale_warning_suppressed=stale_warning_suppressed,
+                reconcile_state_present=reconcile_state_present,
+                reconcile_state_age_seconds=reconcile_state_age_seconds,
+                reconcile_auth_mode="user" if reconcile_state_present else None,
+                reconcile_iso_utc=reconcile_iso_utc,
+                reconcile_attempted=reconcile_attempted,
+                reconcile_downloaded=reconcile_downloaded,
+                reconcile_warnings=reconcile_warnings,
+                reconcile_failed=reconcile_failed,
+                reconcile_terminal_failures=terminal_failures,
+                reconcile_actionable_failures=retryable_failed,
+                reconcile_token_scope_failures=missing_scope_failures,
+                reconcile_failure_reasons=failure_reasons,
+                failure_codes=ws_failures,
+                warning_codes=ws_warnings,
+            )
+        )
+
+    return _finalize_live_validation_report(
+        failures=failures,
+        warnings=warnings,
+        require_live_units=require_live_units,
+        workspaces=workspace_reports,
+    )
+
+
+def _finalize_live_validation_report(
+    *,
+    failures: list[LiveValidationIssue],
+    warnings: list[LiveValidationIssue],
+    require_live_units: bool,
+    workspaces: list[LiveValidationWorkspace],
+) -> LiveValidationReport:
+    failure_codes = sorted({item.code for item in failures})
+    warning_codes = sorted({item.code for item in warnings})
+    if failures:
+        status = "fail"
+        summary = f"Summary: FAIL ({len(failures)} failure{'s' if len(failures) != 1 else ''})"
+        ok = False
+        exit_code = 1
+    elif warnings:
+        status = "pass_with_warnings"
+        summary = f"Summary: PASS with warnings ({len(warnings)})"
+        ok = True
+        exit_code = 0
+    else:
+        status = "pass"
+        summary = "Summary: PASS"
+        ok = True
+        exit_code = 0
+    return LiveValidationReport(
+        ok=ok,
+        status=status,
+        require_live_units=require_live_units,
+        exit_code=exit_code,
+        summary=summary,
+        failure_count=len(failures),
+        warning_count=len(warnings),
+        failure_codes=failure_codes,
+        warning_codes=warning_codes,
+        failures=failures,
+        warnings=warnings,
+        workspaces=workspaces,
+    )
+
+
+def _build_status_report(
+    *,
+    paths: UserEnvPaths | None = None,
+    runner: RunFn = subprocess.run,
+    mcp_probe: McpProbeFn = _probe_managed_mcp_wrapper,
+) -> UserEnvStatusReport:
+    target = paths or default_user_env_paths()
+    reconcile_workspaces: list[dict[str, Any]] = []
+    service_units = sorted(
+        {
+            "slack-receipts-api.service",
+            "slack-receipts-inference.service",
+            "slack-receipts-runtime-report.timer",
+            *[path.name for path in (target.home_dir / ".config" / "systemd" / "user").glob("slack-receipts-*.service")],
+            *[path.name for path in (target.home_dir / ".config" / "systemd" / "user").glob("slack-receipts-*.timer")],
+            *[path.name for path in (target.home_dir / ".config" / "systemd" / "user").glob("slack-mirror-*.service")],
+            *[path.name for path in (target.home_dir / ".config" / "systemd" / "user").glob("slack-mirror-*.timer")],
+        }
+    )
+    states: dict[str, str] = {}
+    for unit_name in dict.fromkeys(service_units):
+        states[unit_name] = _systemctl_state(runner, unit_name)
+    if target.config_path.exists():
+        try:
+            cfg = _load_managed_config(target)
+            for ws in [ws for ws in cfg.get("workspaces", []) if ws.get("name") and ws.get("enabled", True)]:
+                name = str(ws.get("name"))
+                reconcile_state = load_reconcile_state(target.config_path, workspace=name, auth_mode="user")
+                if reconcile_state:
+                    age_seconds: float | None = None
+                    reconcile_ts = reconcile_state.get("ts")
+                    if reconcile_ts is not None:
+                        try:
+                            age_seconds = max(0.0, time.time() - float(reconcile_ts))
+                        except (TypeError, ValueError):
+                            age_seconds = None
+                    failed = int(reconcile_state.get("failed") or 0)
+                    failure_summary = _reconcile_failure_summary(reconcile_state, failed)
+                    reconcile_workspaces.append(
+                        {
+                            "name": name,
+                            "auth_mode": "user",
+                            "state_present": True,
+                            "iso_utc": str(reconcile_state.get("iso_utc") or "") or None,
+                            "age_seconds": age_seconds,
+                            "attempted": int(reconcile_state.get("attempted") or 0),
+                            "downloaded": int(reconcile_state.get("downloaded") or 0),
+                            "warnings": int(reconcile_state.get("warnings") or 0),
+                            "failed": failed,
+                            "terminal_failures": failure_summary["terminal_failures"],
+                            "actionable_failures": failure_summary["actionable_failures"],
+                            "token_scope_failures": failure_summary["token_scope_failures"],
+                            "failure_reasons": failure_summary["failure_reasons"],
+                        }
+                    )
+                else:
+                    reconcile_workspaces.append(
+                        {
+                            "name": name,
+                            "auth_mode": None,
+                            "state_present": False,
+                            "iso_utc": None,
+                            "age_seconds": None,
+                            "attempted": 0,
+                            "downloaded": 0,
+                            "warnings": 0,
+                            "failed": 0,
+                            "terminal_failures": 0,
+                            "actionable_failures": 0,
+                            "token_scope_failures": 0,
+                            "failure_reasons": {},
+                        }
+                    )
+        except Exception:
+            pass
+    mcp_smoke_ok = False
+    mcp_smoke_error: str | None = None
+    mcp_multi_client_ok = False
+    mcp_multi_client_error: str | None = None
+    mcp_multi_client_clients = 4
+    configured_clients = os.environ.get("SLACK_MIRROR_MCP_MULTI_CLIENT_PROBE_CLIENTS", "").strip()
+    if configured_clients:
+        try:
+            mcp_multi_client_clients = max(1, int(configured_clients))
+        except ValueError:
+            mcp_multi_client_clients = 4
+    if target.mcp_wrapper_path.exists():
+        mcp_smoke_ok, mcp_smoke_error = mcp_probe(target.mcp_wrapper_path)
+        if mcp_smoke_ok:
+            mcp_multi_client_ok, mcp_multi_client_error = _probe_managed_mcp_wrapper_multi_client(
+                target.mcp_wrapper_path,
+                clients=mcp_multi_client_clients,
+                single_client_probe=mcp_probe,
+            )
+    return UserEnvStatusReport(
+        wrapper_present=target.wrapper_path.exists(),
+        api_wrapper_present=target.api_wrapper_path.exists(),
+        mcp_wrapper_present=target.mcp_wrapper_path.exists(),
+        receipts_wrapper_present=target.receipts_wrapper_path.exists(),
+        receipts_mcp_wrapper_present=target.receipts_mcp_wrapper_path.exists(),
+        mcp_smoke_ok=mcp_smoke_ok,
+        mcp_smoke_error=mcp_smoke_error,
+        mcp_multi_client_ok=mcp_multi_client_ok,
+        mcp_multi_client_error=mcp_multi_client_error,
+        mcp_multi_client_clients=mcp_multi_client_clients,
+        api_service_present=target.api_service_path.exists(),
+        inference_wrapper_present=target.inference_wrapper_path.exists(),
+        inference_service_present=target.inference_service_path.exists(),
+        snapshot_service_present=target.snapshot_service_path.exists(),
+        snapshot_timer_present=target.snapshot_timer_path.exists(),
+        rollback_snapshot_present=target.backup_app_dir.exists(),
+        config_present=target.config_path.exists(),
+        db_present=(target.state_dir / "slack_mirror.db").exists(),
+        cache_present=target.cache_dir.exists(),
+        services=states,
+        reconcile_workspaces=reconcile_workspaces,
+    )
+
+
+def _status_report_payload(report: UserEnvStatusReport) -> dict[str, Any]:
+    return {
+        "wrapper_present": report.wrapper_present,
+        "api_wrapper_present": report.api_wrapper_present,
+        "mcp_wrapper_present": report.mcp_wrapper_present,
+        "receipts_wrapper_present": report.receipts_wrapper_present,
+        "receipts_mcp_wrapper_present": report.receipts_mcp_wrapper_present,
+        "mcp_smoke_ok": report.mcp_smoke_ok,
+        "mcp_smoke_error": report.mcp_smoke_error,
+        "mcp_multi_client_ok": report.mcp_multi_client_ok,
+        "mcp_multi_client_error": report.mcp_multi_client_error,
+        "mcp_multi_client_clients": report.mcp_multi_client_clients,
+        "api_service_present": report.api_service_present,
+        "inference_wrapper_present": report.inference_wrapper_present,
+        "inference_service_present": report.inference_service_present,
+        "snapshot_service_present": report.snapshot_service_present,
+        "snapshot_timer_present": report.snapshot_timer_present,
+        "rollback_snapshot_present": report.rollback_snapshot_present,
+        "config_present": report.config_present,
+        "db_present": report.db_present,
+        "cache_present": report.cache_present,
+        "services": report.services,
+        "reconcile_workspaces": report.reconcile_workspaces,
+    }
+
+
+def _managed_runtime_issues(status_report: UserEnvStatusReport) -> list[LiveValidationIssue]:
+    failures: list[LiveValidationIssue] = []
+
+    def fail(code: str, message: str, action: str | None = None) -> None:
+        failures.append(LiveValidationIssue("fail", code, message, action=action))
+
+    if not status_report.wrapper_present:
+        fail(
+            "USER_WRAPPER_MISSING",
+            "slack-mirror-user wrapper missing",
+            "rerun `slack-mirror user-env update` to restore the managed CLI wrapper",
+        )
+    if not status_report.receipts_wrapper_present:
+        fail(
+            "RECEIPTS_USER_WRAPPER_MISSING",
+            "slack-receipts-user wrapper alias missing",
+            "rerun `slack-mirror user-env update` to restore the Slack Receipts CLI alias",
+        )
+    if not status_report.api_wrapper_present:
+        fail(
+            "API_WRAPPER_MISSING",
+            "slack-mirror-api wrapper missing",
+            "rerun `slack-mirror user-env update` to restore the managed API launcher",
+        )
+    if not status_report.inference_wrapper_present:
+        fail(
+            "INFERENCE_WRAPPER_MISSING",
+            "slack-mirror-inference wrapper missing",
+            "rerun `slack-mirror user-env update` to restore the managed local inference launcher",
+        )
+    if not status_report.mcp_wrapper_present:
+        fail(
+            "MCP_WRAPPER_MISSING",
+            "slack-mirror-mcp wrapper missing",
+            "rerun `slack-mirror user-env update` to restore the managed MCP launcher",
+        )
+    if not status_report.receipts_mcp_wrapper_present:
+        fail(
+            "RECEIPTS_MCP_WRAPPER_MISSING",
+            "slack-receipts-mcp wrapper alias missing",
+            "rerun `slack-mirror user-env update` to restore the Slack Receipts MCP alias",
+        )
+    elif not status_report.mcp_smoke_ok:
+        fail(
+            "MCP_SMOKE_FAILED",
+            f"managed MCP wrapper failed health probe: {status_report.mcp_smoke_error or 'unknown error'}",
+            "inspect `slack-mirror-mcp` directly, then rerun `slack-mirror user-env update` if the managed MCP launcher or venv is stale",
+        )
+    elif not status_report.mcp_multi_client_ok:
+        fail(
+            "MCP_MULTI_CLIENT_FAILED",
+            "managed MCP wrapper failed concurrent health probes "
+            f"({status_report.mcp_multi_client_clients} clients): "
+            f"{status_report.mcp_multi_client_error or 'unknown error'}",
+            "rerun `slack-mirror user-env check-live --json` and avoid adding multiple MCP clients until the concurrent probe passes",
+        )
+    if not status_report.api_service_present:
+        fail(
+            "API_SERVICE_FILE_MISSING",
+            "managed API service unit file missing",
+            "rerun `slack-mirror user-env update` to recreate slack-receipts-api.service",
+        )
+    if not status_report.inference_service_present:
+        fail(
+            "INFERENCE_SERVICE_FILE_MISSING",
+            "managed local inference service unit file missing",
+            "rerun `slack-mirror user-env update` to recreate slack-receipts-inference.service",
+        )
+    if not status_report.snapshot_service_present:
+        fail(
+            "SNAPSHOT_SERVICE_FILE_MISSING",
+            "managed runtime-report service unit file missing",
+            "rerun `slack-mirror user-env update` to recreate slack-receipts-runtime-report.service",
+        )
+    if not status_report.snapshot_timer_present:
+        fail(
+            "SNAPSHOT_TIMER_FILE_MISSING",
+            "managed runtime-report timer unit file missing",
+            "rerun `slack-mirror user-env update` to recreate slack-receipts-runtime-report.timer",
+        )
+    snapshot_timer_state = status_report.services.get("slack-receipts-runtime-report.timer")
+    if status_report.snapshot_timer_present and snapshot_timer_state != "active":
+        fail(
+            "SNAPSHOT_TIMER_INACTIVE",
+            f"slack-receipts-runtime-report.timer state={snapshot_timer_state or 'unknown'}",
+            "run `systemctl --user enable --now slack-receipts-runtime-report.timer` to restore scheduled runtime snapshots",
+        )
+    return failures
+
+
+def _live_validation_report_payload(report: LiveValidationReport) -> dict[str, Any]:
+    return {
+        "ok": report.ok,
+        "status": report.status,
+        "require_live_units": report.require_live_units,
+        "exit_code": report.exit_code,
+        "summary": report.summary,
+        "failure_count": report.failure_count,
+        "warning_count": report.warning_count,
+        "failure_codes": report.failure_codes,
+        "warning_codes": report.warning_codes,
+        "failures": [
+            {
+                "severity": item.severity,
+                "code": item.code,
+                "message": item.message,
+                "action": item.action,
+                "workspace": item.workspace,
+            }
+            for item in report.failures
+        ],
+        "warnings": [
+            {
+                "severity": item.severity,
+                "code": item.code,
+                "message": item.message,
+                "action": item.action,
+                "workspace": item.workspace,
+            }
+            for item in report.warnings
+        ],
+        "workspaces": [
+            {
+                "name": workspace.name,
+                "event_errors": workspace.event_errors,
+                "embedding_errors": workspace.embedding_errors,
+                "event_pending": workspace.event_pending,
+                "embedding_pending": workspace.embedding_pending,
+                "daemon_heartbeat_age_seconds": workspace.daemon_heartbeat_age_seconds,
+                "active_recent_channels": workspace.active_recent_channels,
+                "shell_like_zero_message_channels": workspace.shell_like_zero_message_channels,
+                "unexpected_empty_channels": workspace.unexpected_empty_channels,
+                "stale_channels": workspace.stale_channels,
+                "stale_warning_suppressed": workspace.stale_warning_suppressed,
+                "reconcile_state_present": workspace.reconcile_state_present,
+                "reconcile_state_age_seconds": workspace.reconcile_state_age_seconds,
+                "reconcile_auth_mode": workspace.reconcile_auth_mode,
+                "reconcile_iso_utc": workspace.reconcile_iso_utc,
+                "reconcile_attempted": workspace.reconcile_attempted,
+                "reconcile_downloaded": workspace.reconcile_downloaded,
+                "reconcile_warnings": workspace.reconcile_warnings,
+                "reconcile_failed": workspace.reconcile_failed,
+                "reconcile_terminal_failures": workspace.reconcile_terminal_failures,
+                "reconcile_actionable_failures": workspace.reconcile_actionable_failures,
+                "reconcile_token_scope_failures": workspace.reconcile_token_scope_failures,
+                "reconcile_failure_reasons": workspace.reconcile_failure_reasons,
+                "failure_codes": workspace.failure_codes,
+                "warning_codes": workspace.warning_codes,
+            }
+            for workspace in report.workspaces
+        ],
+    }
+
+
+def _finalize_live_smoke_report(
+    *,
+    failures: list[LiveValidationIssue],
+    warnings: list[LiveValidationIssue],
+    status_report: UserEnvStatusReport,
+    validation_report: LiveValidationReport,
+) -> LiveSmokeCheckReport:
+    failure_codes = sorted({item.code for item in failures})
+    warning_codes = sorted({item.code for item in warnings})
+    if failures:
+        return LiveSmokeCheckReport(
+            ok=False,
+            status="fail",
+            exit_code=1,
+            summary=f"Summary: FAIL ({len(failures)} failure{'s' if len(failures) != 1 else ''})",
+            failure_count=len(failures),
+            warning_count=len(warnings),
+            failure_codes=failure_codes,
+            warning_codes=warning_codes,
+            failures=failures,
+            warnings=warnings,
+            status_report=status_report,
+            validation_report=validation_report,
+        )
+    if warnings:
+        return LiveSmokeCheckReport(
+            ok=True,
+            status="pass_with_warnings",
+            exit_code=0,
+            summary=f"Summary: PASS with warnings ({len(warnings)})",
+            failure_count=0,
+            warning_count=len(warnings),
+            failure_codes=[],
+            warning_codes=warning_codes,
+            failures=[],
+            warnings=warnings,
+            status_report=status_report,
+            validation_report=validation_report,
+        )
+    return LiveSmokeCheckReport(
+        ok=True,
+        status="pass",
+        exit_code=0,
+        summary="Summary: PASS",
+        failure_count=0,
+        warning_count=0,
+        failure_codes=[],
+        warning_codes=[],
+        failures=[],
+        warnings=[],
+        status_report=status_report,
+        validation_report=validation_report,
+    )
+
+
+def _build_live_smoke_report(
+    *,
+    paths: UserEnvPaths | None = None,
+    runner: RunFn = subprocess.run,
+    mcp_probe: McpProbeFn = _probe_managed_mcp_wrapper,
+) -> LiveSmokeCheckReport:
+    target = paths or default_user_env_paths()
+    status_report = _build_status_report(paths=target, runner=runner, mcp_probe=mcp_probe)
+    validation_report = _build_live_validation_report(paths=target, runner=runner, require_live_units=True)
+    failures = list(validation_report.failures)
+    warnings = list(validation_report.warnings)
+    failures.extend(_managed_runtime_issues(status_report))
+
+    return _finalize_live_smoke_report(
+        failures=failures,
+        warnings=warnings,
+        status_report=status_report,
+        validation_report=validation_report,
+    )
+
+
+def _validate_managed_runtime_baseline(
+    *,
+    paths: UserEnvPaths,
+    runner: RunFn,
+    out: PrintFn,
+    mcp_probe: McpProbeFn,
+    render_validation: bool = True,
+) -> int:
+    validation_report = _build_live_validation_report(
+        paths=paths,
+        runner=runner,
+        require_live_units=False,
+        require_workspace_credentials=False,
+    )
+    if render_validation or validation_report.exit_code != 0:
+        _emit_live_validation_report(paths=paths, report=validation_report, runner=runner, out=out)
+    if validation_report.exit_code != 0:
+        return validation_report.exit_code
+    status_report = _build_status_report(paths=paths, runner=runner, mcp_probe=mcp_probe)
+    failures = _managed_runtime_issues(status_report)
+
+    if not failures:
+        return 0
+
+    for issue in failures:
+        out(f"FAIL  [{issue.code}] {issue.message}")
+    out(f"Summary: FAIL ({len(failures)} failure{'s' if len(failures) != 1 else ''})")
+    seen: set[tuple[str, str]] = set()
+    out("Recovery:")
+    for issue in failures:
+        if not issue.action:
+            continue
+        key = (issue.code, issue.action)
+        if key in seen:
+            continue
+        seen.add(key)
+        out(f"  [{issue.code}] {issue.action}")
+    return 1
+
+
+def _emit_live_validation_report(
+    *,
+    paths: UserEnvPaths,
+    report: LiveValidationReport,
+    runner: RunFn,
+    out: PrintFn,
+) -> None:
+    target = paths
+
+    def emit_actions(items: list[LiveValidationIssue], *, label: str) -> None:
+        actions: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for item in items:
+            code = item.code
+            action = item.action
+            if not action:
+                continue
+            key = (code, action)
+            if key in seen:
+                continue
+            seen.add(key)
+            actions.append(key)
+        if not actions:
+            return
+        out(label)
+        for code, action in actions:
+            out(f"  [{code}] {action}")
+
+    out(f"Config: {target.config_path}")
+    if target.config_path.exists():
+        out("OK    managed config present")
+        try:
+            cfg = _load_managed_config(target)
+            db_path = Path(str(cfg.get("storage", {}).get("db_path", target.state_dir / "slack_mirror.db"))).expanduser()
+            out(f"DB:     {db_path}")
+            if db_path.exists():
+                out("OK    managed DB present")
+        except Exception:
+            pass
+
+    if target.api_service_path.exists():
+        out("OK    slack-receipts-api.service unit file present")
+    if target.inference_service_path.exists():
+        out("OK    slack-receipts-inference.service unit file present")
+    if _systemctl_state(runner, "slack-receipts-api.service") == "active":
+        out("OK    slack-receipts-api.service active")
+
+    for workspace in report.workspaces:
+        if "WORKSPACE_DB_MISSING" not in workspace.failure_codes:
+            out(f"OK    workspace {workspace.name} synced into DB")
+        if "OUTBOUND_TOKEN_MISSING" not in workspace.failure_codes:
+            out(f"OK    workspace {workspace.name} explicit outbound bot token configured")
+        if workspace.stale_warning_suppressed:
+            out(
+                "OK    "
+                f"workspace {workspace.name} stale mirror evidence suppressed "
+                f"({workspace.stale_channels} stale, {workspace.active_recent_channels} active_recent, "
+                f"{workspace.unexpected_empty_channels} unexpected_empty)"
+            )
+        if workspace.reconcile_state_present:
+            age_fragment = ""
+            if workspace.reconcile_state_age_seconds is not None:
+                age_fragment = f", age={int(workspace.reconcile_state_age_seconds)}s"
+            failure_fragment = ""
+            if workspace.reconcile_failed:
+                failure_fragment = (
+                    f", terminal={workspace.reconcile_terminal_failures}, "
+                    f"actionable={workspace.reconcile_actionable_failures}, "
+                    f"scope={workspace.reconcile_token_scope_failures}"
+                )
+            out(
+                "OK    "
+                f"workspace {workspace.name} last reconcile-files "
+                f"(downloaded={workspace.reconcile_downloaded}, warnings={workspace.reconcile_warnings}, "
+                f"failed={workspace.reconcile_failed}{failure_fragment}{age_fragment})"
+            )
+
+    for issue in report.failures:
+        out(f"FAIL  [{issue.code}] {issue.message}")
+    for issue in report.warnings:
+        out(f"WARN  [{issue.code}] {issue.message}")
+
+    out(report.summary)
+    if report.failures:
+        emit_actions(report.failures, label="Recovery:")
+        emit_actions(report.warnings, label="Warnings:")
+    elif report.warnings:
+        emit_actions(report.warnings, label="Warnings:")
+
+
+def _finalize_live_recovery_report(
+    *,
+    actions: list[LiveRecoveryAction],
+    operator_only_issues: list[LiveValidationIssue],
+    smoke_report: LiveSmokeCheckReport,
+    applied: bool,
+) -> LiveRecoveryReport:
+    actionable_codes = sorted({item.code for item in actions})
+    operator_only_codes = sorted({item.code for item in operator_only_issues})
+    if actions:
+        status = "actionable"
+        summary = f"Summary: ACTIONABLE ({len(actions)} safe remediation{'s' if len(actions) != 1 else ''})"
+        ok = True
+        exit_code = 0
+    elif operator_only_issues:
+        status = "operator_only"
+        summary = f"Summary: OPERATOR_ONLY ({len(operator_only_issues)} issue{'s' if len(operator_only_issues) != 1 else ''})"
+        ok = False
+        exit_code = 1
+    else:
+        status = "pass"
+        summary = "Summary: PASS"
+        ok = True
+        exit_code = 0
+    return LiveRecoveryReport(
+        ok=ok,
+        status=status,
+        exit_code=exit_code,
+        applied=applied,
+        summary=summary,
+        actionable_count=len(actions),
+        operator_only_count=len(operator_only_issues),
+        action_codes=actionable_codes,
+        operator_only_codes=operator_only_codes,
+        actions=actions,
+        operator_only_issues=operator_only_issues,
+        smoke_report=smoke_report,
+    )
+
+
+def _build_live_recovery_report(
+    *,
+    paths: UserEnvPaths | None = None,
+    runner: RunFn = subprocess.run,
+    mcp_probe: McpProbeFn = _probe_managed_mcp_wrapper,
+    applied: bool = False,
+) -> LiveRecoveryReport:
+    smoke_report = _build_live_smoke_report(paths=paths, runner=runner, mcp_probe=mcp_probe)
+    actions: list[LiveRecoveryAction] = []
+    operator_only_issues: list[LiveValidationIssue] = []
+    seen_actions: set[tuple[str, str | None]] = set()
+    managed_runtime_refresh_needed = False
+
+    def add_action(code: str, description: str, command: list[str], *, workspace: str | None = None) -> None:
+        key = (code, workspace)
+        if key in seen_actions:
+            return
+        seen_actions.add(key)
+        actions.append(LiveRecoveryAction(code=code, description=description, command=command, safe=True, workspace=workspace))
+
+    for issue in smoke_report.failures:
+        if issue.code in {
+            "USER_WRAPPER_MISSING",
+            "API_WRAPPER_MISSING",
+            "INFERENCE_WRAPPER_MISSING",
+            "MCP_WRAPPER_MISSING",
+            "MCP_SMOKE_FAILED",
+            "API_SERVICE_FILE_MISSING",
+            "INFERENCE_SERVICE_FILE_MISSING",
+            "SNAPSHOT_SERVICE_FILE_MISSING",
+            "SNAPSHOT_TIMER_FILE_MISSING",
+        }:
+            managed_runtime_refresh_needed = True
+        elif issue.code == "API_UNIT_INACTIVE":
+            add_action(
+                "RESTART_API_UNIT",
+                "restart the managed API service",
+                ["systemctl", "--user", "restart", "slack-receipts-api.service"],
+            )
+        elif issue.code == "SNAPSHOT_TIMER_INACTIVE":
+            add_action(
+                "ENABLE_SNAPSHOT_TIMER",
+                "re-enable the managed runtime-report timer",
+                ["systemctl", "--user", "enable", "--now", "slack-receipts-runtime-report.timer"],
+            )
+        elif issue.code == "LIVE_UNIT_INACTIVE" and issue.workspace:
+            add_action(
+                "RESTART_WORKSPACE_UNITS",
+                f"restart the managed live units for workspace {issue.workspace}",
+                [
+                    "systemctl",
+                    "--user",
+                    "restart",
+                    f"slack-receipts-webhooks-{issue.workspace}.service",
+                    f"slack-receipts-daemon-{issue.workspace}.service",
+                ],
+                workspace=issue.workspace,
+            )
+        else:
+            operator_only_issues.append(issue)
+
+    if managed_runtime_refresh_needed:
+        add_action(
+            "REFRESH_MANAGED_RUNTIME",
+            "refresh the managed install artifacts from the current repo",
+            ["slack-mirror", "user-env", "update"],
+        )
+
+    return _finalize_live_recovery_report(
+        actions=actions,
+        operator_only_issues=operator_only_issues,
+        smoke_report=smoke_report,
+        applied=applied,
+    )
+
+
+def _run_migrations(paths: UserEnvPaths, *, runner: RunFn, out: PrintFn) -> None:
+    _log(out, "running schema migrations (mirror init)")
+    env = _runtime_env(paths)
+    venv_python = str(paths.venv_dir / "bin" / "python")
+    base = [venv_python, "-m", "slack_mirror.cli.main", "--config", str(paths.config_path)]
+    _run(runner, [*base, "mirror", "init"], env=env)
+    _log(out, "syncing workspace definitions")
+    _run(runner, [*base, "workspaces", "sync-config"], env=env)
+
+
+def install_user_env(
+    *,
+    paths: UserEnvPaths | None = None,
+    runner: RunFn = subprocess.run,
+    python_executable: str | None = None,
+    extras: Sequence[str] | None = None,
+    mcp_probe: McpProbeFn = _probe_managed_mcp_wrapper,
+    out: PrintFn = print,
+) -> int:
+    target = paths or default_user_env_paths()
+    _log(out, "installing isolated user environment")
+    _ensure_dirs(target)
+    _write_env_file(target)
+    _copy_repo_snapshot(target)
+    _ensure_venv(target, runner=runner, python_executable=python_executable, out=out)
+    _install_python_package(target, runner=runner, out=out, extras=extras)
+    _ensure_config(target, out=out)
+    _migrate_legacy_state(target, out=out)
+    _write_wrappers(target)
+    _write_api_service(target)
+    _write_inference_service(target)
+    _write_snapshot_report_units(target)
+    _run_migrations(target, runner=runner, out=out)
+    runner(["systemctl", "--user", "daemon-reload"], check=False, text=True)
+    runner(["systemctl", "--user", "enable", "--now", "slack-receipts-api.service"], check=False, text=True)
+    runner(["systemctl", "--user", "enable", "--now", "slack-receipts-runtime-report.timer"], check=False, text=True)
+    _log(out, "running managed-runtime validation")
+    validation_rc = _validate_managed_runtime_baseline(paths=target, runner=runner, out=out, mcp_probe=mcp_probe)
+    if validation_rc != 0:
+        return validation_rc
+    _log(out, "install complete")
+    out("")
+    out(f"CLI wrapper: {target.wrapper_path}")
+    out(f"Receipts CLI: {target.receipts_wrapper_path}")
+    out(f"API wrapper:  {target.api_wrapper_path}")
+    out(f"Inf wrapper:  {target.inference_wrapper_path}")
+    out(f"MCP wrapper:  {target.mcp_wrapper_path}")
+    out(f"Receipts MCP: {target.receipts_mcp_wrapper_path}")
+    out(f"API unit:    {target.api_service_path}")
+    out(f"Inf unit:    {target.inference_service_path}")
+    out(f"Config:      {target.config_path}")
+    out(f"State dir:   {target.state_dir}")
+    out(f"Cache dir:   {target.cache_dir}")
+    out("")
+    out("Next: edit config and run:")
+    out(f"  {target.wrapper_path} workspaces verify")
+    return 0
+
+
+def update_user_env(
+    *,
+    paths: UserEnvPaths | None = None,
+    runner: RunFn = subprocess.run,
+    python_executable: str | None = None,
+    extras: Sequence[str] | None = None,
+    mcp_probe: McpProbeFn = _probe_managed_mcp_wrapper,
+    out: PrintFn = print,
+) -> int:
+    target = paths or default_user_env_paths()
+    _log(out, "updating isolated user environment from current repo")
+    _ensure_dirs(target)
+    _write_env_file(target)
+    _rotate_app_snapshot_backup(target, out=out)
+    _copy_repo_snapshot(target)
+    _ensure_venv(target, runner=runner, python_executable=python_executable, out=out)
+    _install_python_package(target, runner=runner, out=out, extras=extras)
+    _ensure_config(target, out=out)
+    _migrate_legacy_state(target, out=out)
+    _write_wrappers(target)
+    _write_api_service(target)
+    _write_inference_service(target)
+    _write_snapshot_report_units(target)
+    runner(["systemctl", "--user", "daemon-reload"], check=False, text=True)
+    paused_units = _pause_managed_runtime_for_migrations(target, runner=runner, out=out)
+    try:
+        _run_migrations(target, runner=runner, out=out)
+    finally:
+        _restore_managed_runtime_units(paused_units, runner=runner, out=out)
+    runner(["systemctl", "--user", "restart", "slack-receipts-api.service"], check=False, text=True)
+    runner(["systemctl", "--user", "enable", "--now", "slack-receipts-runtime-report.timer"], check=False, text=True)
+    _log(out, "running managed-runtime validation")
+    validation_rc = _validate_managed_runtime_baseline(
+        paths=target,
+        runner=runner,
+        out=out,
+        mcp_probe=mcp_probe,
+        render_validation=False,
+    )
+    if validation_rc != 0:
+        return validation_rc
+    check_live_user_env(paths=target, runner=runner, mcp_probe=mcp_probe, out=out, json_output=False)
+    _log(out, "update complete (config + DB preserved)")
+    out(f"Latest config template saved at: {target.config_dir / 'config.example.latest.yaml'}")
+    out(f"Rollback snapshot: {target.backup_app_dir}")
+    out("If this update is bad, run `slack-mirror user-env rollback` to restore the previous app snapshot.")
+    return 0
+
+
+def rollback_user_env(
+    *,
+    paths: UserEnvPaths | None = None,
+    runner: RunFn = subprocess.run,
+    python_executable: str | None = None,
+    mcp_probe: McpProbeFn = _probe_managed_mcp_wrapper,
+    out: PrintFn = print,
+) -> int:
+    target = paths or default_user_env_paths()
+    _log(out, "rolling back isolated user environment to previous app snapshot")
+    _ensure_dirs(target)
+    _write_env_file(target)
+    if not target.backup_app_dir.exists():
+        out(f"No rollback snapshot found at: {target.backup_app_dir}")
+        out("Run `slack-mirror user-env update` at least once before using rollback.")
+        return 1
+
+    _swap_app_snapshot_with_backup(target, out=out)
+    _ensure_venv(target, runner=runner, python_executable=python_executable, out=out)
+    _install_python_package(target, runner=runner, out=out)
+    _ensure_config(target, out=out)
+    _migrate_legacy_state(target, out=out)
+    _write_wrappers(target)
+    _write_api_service(target)
+    _write_inference_service(target)
+    _write_snapshot_report_units(target)
+    runner(["systemctl", "--user", "daemon-reload"], check=False, text=True)
+    runner(["systemctl", "--user", "restart", "slack-receipts-api.service"], check=False, text=True)
+    runner(["systemctl", "--user", "enable", "--now", "slack-receipts-runtime-report.timer"], check=False, text=True)
+    _log(out, "running managed-runtime validation")
+    validation_rc = _validate_managed_runtime_baseline(paths=target, runner=runner, out=out, mcp_probe=mcp_probe)
+    if validation_rc != 0:
+        return validation_rc
+    _log(out, "rollback complete (config + DB preserved)")
+    out("Rollback restored the previous app snapshot and refreshed the managed venv/wrappers.")
+    out("Rollback does not reverse DB schema, queue contents, or other runtime state changes.")
+    return 0
+
+
+def uninstall_user_env(
+    *,
+    purge_data: bool = False,
+    paths: UserEnvPaths | None = None,
+    runner: RunFn = subprocess.run,
+    out: PrintFn = print,
+) -> int:
+    target = paths or default_user_env_paths()
+    _log(out, "stopping/removing user services if present")
+    legacy_units = [
+        "slack-mirror-webhooks.service",
+        "slack-mirror-events.service",
+        "slack-mirror-embeddings.service",
+        "slack-receipts-api.service",
+        "slack-receipts-inference.service",
+        "slack-receipts-runtime-report.service",
+        "slack-receipts-runtime-report.timer",
+    ]
+    runner(["systemctl", "--user", "disable", "--now", *legacy_units], check=False, text=True)
+    for unit_name in legacy_units:
+        unit_path = target.home_dir / ".config" / "systemd" / "user" / unit_name
+        if unit_path.exists():
+            unit_path.unlink()
+    runner(["systemctl", "--user", "daemon-reload"], check=False, text=True)
+
+    _log(out, "removing wrapper + app + venv")
+    for wrapper in (
+        target.wrapper_path,
+        target.receipts_wrapper_path,
+        target.api_wrapper_path,
+        target.inference_wrapper_path,
+        target.mcp_wrapper_path,
+        target.receipts_mcp_wrapper_path,
+    ):
+        if wrapper.exists():
+            wrapper.unlink()
+    if target.api_service_path.exists():
+        target.api_service_path.unlink()
+    if target.inference_service_path.exists():
+        target.inference_service_path.unlink()
+    if target.snapshot_service_path.exists():
+        target.snapshot_service_path.unlink()
+    if target.snapshot_timer_path.exists():
+        target.snapshot_timer_path.unlink()
+    if target.app_dir.exists():
+        shutil.rmtree(target.app_dir)
+    if target.backup_app_dir.exists():
+        shutil.rmtree(target.backup_app_dir)
+    if target.venv_dir.exists():
+        shutil.rmtree(target.venv_dir)
+
+    if purge_data:
+        _log(out, "purging config + data")
+        for path in (target.config_dir, target.state_dir, target.cache_dir):
+            if path.exists():
+                shutil.rmtree(path)
+    else:
+        _log(out, "preserving config + data")
+
+    _log(out, "uninstall complete")
+    return 0
+
+
+def status_user_env(
+    *,
+    paths: UserEnvPaths | None = None,
+    runner: RunFn = subprocess.run,
+    mcp_probe: McpProbeFn = _probe_managed_mcp_wrapper,
+    out: PrintFn = print,
+    json_output: bool = False,
+) -> int:
+    target = paths or default_user_env_paths()
+    report = _build_status_report(paths=target, runner=runner, mcp_probe=mcp_probe)
+    if json_output:
+        out(json.dumps(_status_report_payload(report), indent=2, sort_keys=True))
+        return 0
+    db_path = target.state_dir / "slack_mirror.db"
+    out(f"Wrapper:  {target.wrapper_path}")
+    out("  status: present" if target.wrapper_path.exists() else "  status: missing")
+    out(f"Receipts: {target.receipts_wrapper_path}")
+    out("  status: present" if target.receipts_wrapper_path.exists() else "  status: missing")
+    out(f"API:      {target.api_wrapper_path}")
+    out("  status: present" if target.api_wrapper_path.exists() else "  status: missing")
+    out(f"Inf:      {target.inference_wrapper_path}")
+    out("  status: present" if target.inference_wrapper_path.exists() else "  status: missing")
+    out(f"MCP:      {target.mcp_wrapper_path}")
+    out("  status: present" if target.mcp_wrapper_path.exists() else "  status: missing")
+    out(f"R-MCP:    {target.receipts_mcp_wrapper_path}")
+    out("  status: present" if target.receipts_mcp_wrapper_path.exists() else "  status: missing")
+    if target.mcp_wrapper_path.exists():
+        out(f"  probe:  {'pass' if report.mcp_smoke_ok else 'fail'}")
+        if report.mcp_smoke_error:
+            out(f"  detail: {report.mcp_smoke_error}")
+        out(
+            "  concurrent probe: "
+            f"{'pass' if report.mcp_multi_client_ok else 'fail'} "
+            f"({report.mcp_multi_client_clients} clients)"
+        )
+        if report.mcp_multi_client_error:
+            out(f"  concurrent detail: {report.mcp_multi_client_error}")
+    out(f"API svc:  {target.api_service_path}")
+    out("  status: present" if target.api_service_path.exists() else "  status: missing")
+    out(f"Inf svc:  {target.inference_service_path}")
+    out("  status: present" if target.inference_service_path.exists() else "  status: missing")
+    out(f"Rpt svc:  {target.snapshot_service_path}")
+    out("  status: present" if target.snapshot_service_path.exists() else "  status: missing")
+    out(f"Rpt tmr:  {target.snapshot_timer_path}")
+    out("  status: present" if target.snapshot_timer_path.exists() else "  status: missing")
+    out(f"Rollback: {target.backup_app_dir}")
+    out("  status: present" if target.backup_app_dir.exists() else "  status: missing")
+    out(f"Config:   {target.config_path}")
+    out("  status: present" if target.config_path.exists() else "  status: missing")
+    out(f"DB:       {db_path}")
+    out("  status: present" if db_path.exists() else "  status: missing")
+    out(f"Cache:    {target.cache_dir}")
+    out("  status: present" if target.cache_dir.exists() else "  status: missing")
+    out("Services:")
+    completed = runner(
+        ["systemctl", "--user", "--no-pager", "--full", "list-units", "slack-mirror*", "--all", "--plain"],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    stdout = (completed.stdout or "").strip()
+    out(stdout if stdout else "  status: unavailable")
+    if report.reconcile_workspaces:
+        out("Reconcile state:")
+        for item in report.reconcile_workspaces:
+            if not item["state_present"]:
+                out(f"  {item['name']}: missing")
+                continue
+            age_fragment = ""
+            if item["age_seconds"] is not None:
+                age_fragment = f", age={int(item['age_seconds'])}s"
+            out(
+                f"  {item['name']}: downloaded={item['downloaded']} warnings={item['warnings']} "
+                f"failed={item['failed']}{age_fragment}"
+            )
+    return 0
+
+
+def validate_live_user_env(
+    *,
+    paths: UserEnvPaths | None = None,
+    runner: RunFn = subprocess.run,
+    out: PrintFn = print,
+    require_live_units: bool = True,
+    require_workspace_credentials: bool = True,
+    json_output: bool = False,
+) -> int:
+    target = paths or default_user_env_paths()
+    report = _build_live_validation_report(
+        paths=target,
+        runner=runner,
+        require_live_units=require_live_units,
+        require_workspace_credentials=require_workspace_credentials,
+    )
+    if json_output:
+        out(json.dumps(_live_validation_report_payload(report), indent=2, sort_keys=True))
+        return report.exit_code
+    _emit_live_validation_report(paths=target, report=report, runner=runner, out=out)
+    return report.exit_code
+
+
+def check_live_user_env(
+    *,
+    paths: UserEnvPaths | None = None,
+    runner: RunFn = subprocess.run,
+    mcp_probe: McpProbeFn = _probe_managed_mcp_wrapper,
+    out: PrintFn = print,
+    json_output: bool = False,
+) -> int:
+    target = paths or default_user_env_paths()
+    report = _build_live_smoke_report(paths=target, runner=runner, mcp_probe=mcp_probe)
+
+    if json_output:
+        out(
+            json.dumps(
+                {
+                    "ok": report.ok,
+                    "status": report.status,
+                    "exit_code": report.exit_code,
+                    "summary": report.summary,
+                    "failure_count": report.failure_count,
+                    "warning_count": report.warning_count,
+                    "failure_codes": report.failure_codes,
+                    "warning_codes": report.warning_codes,
+                    "failures": [
+                        {
+                            "severity": item.severity,
+                            "code": item.code,
+                            "message": item.message,
+                            "action": item.action,
+                            "workspace": item.workspace,
+                        }
+                        for item in report.failures
+                    ],
+                    "warnings": [
+                        {
+                            "severity": item.severity,
+                            "code": item.code,
+                            "message": item.message,
+                            "action": item.action,
+                            "workspace": item.workspace,
+                        }
+                        for item in report.warnings
+                    ],
+                    "status_report": _status_report_payload(report.status_report),
+                    "validation_report": _live_validation_report_payload(report.validation_report),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return report.exit_code
+
+    out("Managed Runtime:")
+    out(f"  wrapper: {'present' if report.status_report.wrapper_present else 'missing'}")
+    out(f"  api wrapper: {'present' if report.status_report.api_wrapper_present else 'missing'}")
+    out(f"  inference wrapper: {'present' if report.status_report.inference_wrapper_present else 'missing'}")
+    out(f"  mcp wrapper: {'present' if report.status_report.mcp_wrapper_present else 'missing'}")
+    if report.status_report.mcp_wrapper_present:
+        out(f"  mcp probe: {'pass' if report.status_report.mcp_smoke_ok else 'fail'}")
+        if report.status_report.mcp_smoke_error:
+            out(f"  mcp detail: {report.status_report.mcp_smoke_error}")
+        out(
+            "  mcp concurrent probe: "
+            f"{'pass' if report.status_report.mcp_multi_client_ok else 'fail'} "
+            f"({report.status_report.mcp_multi_client_clients} clients)"
+        )
+        if report.status_report.mcp_multi_client_error:
+            out(f"  mcp concurrent detail: {report.status_report.mcp_multi_client_error}")
+    out(f"  api unit file: {'present' if report.status_report.api_service_present else 'missing'}")
+    out(f"  inference unit file: {'present' if report.status_report.inference_service_present else 'missing'}")
+    out(f"  runtime-report service file: {'present' if report.status_report.snapshot_service_present else 'missing'}")
+    out(f"  runtime-report timer file: {'present' if report.status_report.snapshot_timer_present else 'missing'}")
+    timer_state = report.status_report.services.get("slack-receipts-runtime-report.timer", "unknown")
+    out(f"  runtime-report timer state: {timer_state}")
+    out("")
+    out("Live Validation:")
+    validate_live_user_env(paths=target, runner=runner, out=out, require_live_units=True, json_output=False)
+
+    wrapper_failures = [item for item in report.failures if item.code in {
+        "USER_WRAPPER_MISSING",
+        "API_WRAPPER_MISSING",
+        "INFERENCE_WRAPPER_MISSING",
+        "MCP_WRAPPER_MISSING",
+        "MCP_SMOKE_FAILED",
+        "API_SERVICE_FILE_MISSING",
+        "INFERENCE_SERVICE_FILE_MISSING",
+        "SNAPSHOT_SERVICE_FILE_MISSING",
+        "SNAPSHOT_TIMER_FILE_MISSING",
+        "SNAPSHOT_TIMER_INACTIVE",
+    }]
+    if wrapper_failures:
+        out("Managed Runtime Recovery:")
+        seen: set[tuple[str, str | None]] = set()
+        for item in wrapper_failures:
+            key = (item.code, item.action)
+            if key in seen:
+                continue
+            seen.add(key)
+            if item.action:
+                out(f"  [{item.code}] {item.action}")
+    out(f"Combined {report.summary}")
+    return report.exit_code
+
+
+def provision_frontend_user_user_env(
+    *,
+    username: str,
+    display_name: str | None = None,
+    password: str | None = None,
+    password_env: str | None = None,
+    reset_password: bool = False,
+    json_output: bool = False,
+    out: PrintFn = print,
+    paths: UserEnvPaths | None = None,
+) -> int:
+    target = paths or default_user_env_paths()
+    if not target.config_path.exists():
+        payload = {
+            "ok": False,
+            "code": "CONFIG_MISSING",
+            "message": f"managed config missing: {target.config_path}",
+        }
+        if json_output:
+            out(json.dumps(payload, indent=2))
+        else:
+            out(f"ERROR  managed config missing: {target.config_path}")
+        return 1
+
+    resolved_password = password
+    password_source = "prompt"
+    if resolved_password is None and password_env:
+        env_name = str(password_env).strip()
+        if not env_name:
+            raise ValueError("password_env is required when using password_env mode")
+        resolved_password = os.environ.get(env_name)
+        password_source = f"env:{env_name}"
+        if resolved_password is None:
+            raise ValueError(f"password environment variable is not set: {env_name}")
+    if resolved_password is None:
+        first = getpass("New local frontend-auth password: ")
+        second = getpass("Confirm password: ")
+        if first != second:
+            raise ValueError("password confirmation does not match")
+        resolved_password = first
+
+    from slack_mirror.service.app import get_app_service
+
+    service = get_app_service(str(target.config_path))
+    conn = service.connect()
+    provisioned = service.provision_frontend_user(
+        conn,
+        username=username,
+        password=str(resolved_password),
+        display_name=display_name,
+        reset_password=reset_password,
+    )
+    auth_status = service.frontend_auth_status(conn)
+    payload = {
+        "ok": True,
+        "user": {
+            "user_id": provisioned.user_id,
+            "username": provisioned.username,
+            "display_name": provisioned.display_name,
+            "created": provisioned.created,
+            "password_updated": provisioned.password_updated,
+        },
+        "auth": {
+            "enabled": bool(auth_status.get("enabled")),
+            "registration_mode": auth_status.get("registration_mode"),
+            "user_count": int(auth_status.get("user_count") or 0),
+        },
+        "password_source": password_source,
+    }
+    if json_output:
+        out(json.dumps(payload, indent=2))
+    else:
+        action = "created" if provisioned.created else "updated"
+        out(
+            "Provisioned frontend auth user "
+            f"username={provisioned.username} action={action} "
+            f"registration_mode={auth_status.get('registration_mode')} "
+            f"user_count={int(auth_status.get('user_count') or 0)}"
+        )
+    return 0
+
+
+def recover_live_user_env(
+    *,
+    paths: UserEnvPaths | None = None,
+    runner: RunFn = subprocess.run,
+    mcp_probe: McpProbeFn = _probe_managed_mcp_wrapper,
+    out: PrintFn = print,
+    apply: bool = False,
+    json_output: bool = False,
+) -> int:
+    target = paths or default_user_env_paths()
+    initial = _build_live_recovery_report(paths=target, runner=runner, mcp_probe=mcp_probe, applied=False)
+
+    if apply and initial.actions:
+        runner(["systemctl", "--user", "daemon-reload"], check=False, text=True)
+        for action in initial.actions:
+            if action.code == "REFRESH_MANAGED_RUNTIME":
+                update_user_env(
+                    paths=target,
+                    runner=runner,
+                    mcp_probe=mcp_probe,
+                    out=lambda _: None,
+                )
+            elif action.command:
+                runner(action.command, check=False, text=True)
+        report = _build_live_recovery_report(paths=target, runner=runner, mcp_probe=mcp_probe, applied=True)
+    else:
+        report = initial
+
+    if json_output:
+        out(
+            json.dumps(
+                {
+                    "ok": report.ok,
+                    "status": report.status,
+                    "exit_code": report.exit_code,
+                    "applied": report.applied,
+                    "summary": report.summary,
+                    "actionable_count": report.actionable_count,
+                    "operator_only_count": report.operator_only_count,
+                    "action_codes": report.action_codes,
+                    "operator_only_codes": report.operator_only_codes,
+                    "actions": [
+                        {
+                            "code": item.code,
+                            "description": item.description,
+                            "command": item.command,
+                            "safe": item.safe,
+                            "workspace": item.workspace,
+                        }
+                        for item in report.actions
+                    ],
+                    "operator_only_issues": [
+                        {
+                            "severity": item.severity,
+                            "code": item.code,
+                            "message": item.message,
+                            "action": item.action,
+                            "workspace": item.workspace,
+                        }
+                        for item in report.operator_only_issues
+                    ],
+                    "smoke_report": {
+                        "ok": report.smoke_report.ok,
+                        "status": report.smoke_report.status,
+                        "exit_code": report.smoke_report.exit_code,
+                        "summary": report.smoke_report.summary,
+                        "failure_codes": report.smoke_report.failure_codes,
+                        "warning_codes": report.smoke_report.warning_codes,
+                    },
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return report.exit_code
+
+    if not report.actions and not report.operator_only_issues:
+        out("Safe Recovery Plan:")
+        out("  no remediation needed")
+        out(report.summary)
+        return report.exit_code
+
+    out("Safe Recovery Plan:")
+    if report.actions:
+        for action in report.actions:
+            scope = f" ({action.workspace})" if action.workspace else ""
+            out(f"  [{action.code}]{scope} {action.description}")
+            if action.command:
+                out(f"    command: {' '.join(action.command)}")
+    else:
+        out("  no safe automatic remediations available")
+
+    if report.operator_only_issues:
+        out("Operator-Only Issues:")
+        for issue in report.operator_only_issues:
+            scope = f" ({issue.workspace})" if issue.workspace else ""
+            out(f"  [{issue.code}]{scope} {issue.message}")
+            if issue.action:
+                out(f"    next: {issue.action}")
+
+    if apply and initial.actions:
+        out("Apply Mode:")
+        out("  executed safe remediations and rebuilt the recovery plan")
+    elif apply:
+        out("Apply Mode:")
+        out("  nothing safe to apply")
+
+    out(report.summary)
+    return report.exit_code

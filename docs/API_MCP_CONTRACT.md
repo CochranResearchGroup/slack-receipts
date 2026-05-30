@@ -1,0 +1,1653 @@
+# API and MCP Contract
+
+This document defines the minimal transport contract for the shipped local API and MCP surfaces.
+
+It is not a full endpoint catalog. It captures the response shapes and semantics that callers can rely on across both transports.
+
+## Scope
+
+Current shared contract coverage:
+
+- frontend auth
+- runtime status
+- live runtime validation
+- runtime report listing
+- runtime report CRUD
+- export CRUD
+- corpus search
+- search readiness
+- search health
+- outbound message sends
+- outbound thread replies
+- outbound reaction status signals
+- listener registration
+- listener delivery listing
+- listener delivery acknowledgement
+- shared error envelope
+
+The local HTTP API and MCP server are both thin wrappers over `slack_mirror.service.app`. When these contracts change, they should change together.
+
+## MCP Initialize
+
+The MCP stdio server now negotiates the caller's requested `initialize.params.protocolVersion`
+when it is one of the repo-supported protocol versions. Today the supported set is:
+
+- `2024-11-05`
+- `2025-03-26`
+- `2025-06-18`
+
+If the caller omits `protocolVersion` or requests an unsupported value, the server falls back to
+the current default `2025-03-26`.
+
+For handshake debugging, the MCP server also supports opt-in tracing:
+
+- `SLACK_MIRROR_MCP_TRACE=1`
+- optional `SLACK_MIRROR_MCP_TRACE_FILE=/absolute/path/to/trace.jsonl`
+
+When enabled, the server emits one JSON object per line for:
+
+- process startup
+- frame read and write boundaries
+- `initialize` request details, including requested and negotiated protocol version
+- early `tools/list` and `tools/call` dispatch, including tool-call failures
+
+If `SLACK_MIRROR_MCP_TRACE_FILE` is unset, trace lines go to stderr.
+
+## MCP Release Baseline
+
+The first stable user-scoped release treats MCP as a supported local operator interface when it is reached through the managed launcher:
+
+```bash
+~/.local/bin/slack-mirror-mcp
+```
+
+Before adding MCP clients or another agent runtime, use these gates:
+
+```bash
+slack-receipts-user user-env status --json
+slack-receipts-user user-env check-live --json
+slack-receipts release check --require-managed-runtime --json
+```
+
+The managed-runtime checks verify the MCP wrapper with a real stdio health request and a bounded concurrent readiness probe. A passing single process does not replace `check-live` when multiple clients will be configured.
+
+MCP clients should reconnect after `slack-receipts user-env update` or `slack-receipts-user user-env update`. Long-lived clients keep the tool schema and server code they loaded at process start.
+
+The managed runtime status probes are safe for agent-client environments that do not inherit the normal interactive shell DBus variables. The service rehydrates the user runtime and bus environment before calling `systemctl --user`, so `runtime.status` and `runtime.live_validation` should not report every unit inactive solely because `XDG_RUNTIME_DIR` or `DBUS_SESSION_BUS_ADDRESS` was missing at client launch.
+
+Supported release-baseline MCP tool groups:
+
+- runtime and install health: `health`, `runtime.status`, `runtime.live_validation`, `runtime.report.latest`, `workspaces.list`, `workspace.status`
+- conversation discovery and scoped review: `conversations.list`, `search.conversation`
+- direct thread retrieval: `permalink.resolve`, `thread.get`, `thread.from_permalink`
+- search and retrieval diagnostics: `search.corpus`, `search.context_pack`, `search.readiness`, `search.health`, `search.profiles`, `search.semantic_readiness`
+- outbound actions: `messages.send`, `threads.reply`, `reactions.add`, `reactions.remove`
+- channel management: `channels.create`
+- listener workflow: `listeners.register`, `listeners.list`, `listeners.status`, `listeners.unregister`, `deliveries.list`, `deliveries.ack`
+
+Recommended operator preflight from MCP clients:
+
+- call `health` to confirm the stdio server is responsive
+- call `runtime.status` to read managed artifact, service, MCP smoke, and concurrent-MCP readiness state
+- call `runtime.live_validation` when the client needs stricter workspace, token, queue, DB, and live-unit health
+- call `workspace.status` before workspace-scoped search or outbound actions
+- call `conversations.list` when the client needs to discover MPDM, IM, private-channel, or public-channel candidates before searching or exporting context
+- call `thread.from_permalink` when the user provides a Slack archive permalink; include `include_derived_text` / `include_ocr` when file or screenshot evidence may matter; do not start with semantic search, browser Slack, or direct Slack Web API when the URL already carries workspace/channel/thread identity
+- call `search.conversation` when the client wants discovery, scoped search, and ready-to-expand context/export payloads in one read-only workflow
+- call `search.readiness` or `search.semantic_readiness` before assuming semantic coverage is complete
+
+Outbound tools are real writes. Use them only after workspace token verification, and prefer an `options.idempotency_key` for retryable sends. `messages.send` accepts channel references or DM-style targets according to the shared outbound service contract; `threads.reply` requires an existing channel reference and thread timestamp/reference; `reactions.add` and `reactions.remove` target an existing message by channel reference plus Slack message timestamp.
+
+Reaction writes are intended for lightweight subscriber status signals such as
+received, processing, applied, blocked, or needs input. They default to the
+workspace bot/app write token. Callers that set `options.auth_mode: "user"`
+must ensure the workspace user write token has `reactions:write`; otherwise
+Slack will reject the write with `missing_scope`.
+
+Channel-management tools are also real writes. `channels.create` normalizes the requested name to a Slack-compatible lowercase name, resolves invitees before creating a new Slack channel, creates or reuses a mirrored same-name channel when public/private settings match, and invites the resolved users.
+
+Listener tools are for agent-consumable event delivery. Register a listener with `listeners.register`, inspect it with `listeners.status`, poll work with `deliveries.list`, and acknowledge completion or failure with `deliveries.ack`.
+
+First-release MCP non-goals:
+
+- tenant onboarding, manifest generation, Slack credential installation, and live-service installation remain CLI/browser workflows
+- frontend auth, password/session management, and browser user provisioning remain API/browser/CLI workflows
+- named runtime-report browsing, runtime-report CRUD, export CRUD, and HTML/PDF/DOCX export generation remain API/browser/CLI workflows
+- heavy semantic rollout, BGE backfill, and reranker rollout remain explicit CLI/operator work rather than automatic MCP side effects
+
+MCP tool failures use JSON-RPC `error` responses. The `error.data` value contains the shared service error envelope so clients can branch on stable fields instead of parsing prose.
+
+MCP success payloads are expected to be JSON-safe. Private binary fields such
+as embedding blobs are not part of the MCP contract; if a bytes-like value
+escapes an internal service result, MCP omits the bytes and emits a compact
+placeholder with `type: binary`, `encoding: omitted`, and `size` instead of
+failing the whole tool response.
+
+`conversations.list` is read-only and returns conversation metadata, not message
+bodies. It accepts:
+
+- `workspace`: workspace name for a single-workspace scan
+- `all_workspaces`: scan enabled workspaces; omit `workspace` when true
+- `channel_type`: one of `public_channel`, `private_channel`, `im`, or `mpdm`
+- `name_query`: case-insensitive match against the mirrored channel name/id
+- `member_query`: case-insensitive match against mirrored member labels, names,
+  user ids, or the conversation name/id as a fallback when membership rows are
+  sparse
+- `limit`: bounded result count, capped by the service
+
+Rows include workspace, channel id/name, conversation type, message count,
+latest Slack timestamp/ISO timestamp, member count, and member labels where the
+mirror has channel membership. Use `conversations.list` to find candidate
+conversations, `search.corpus` to select result candidates, and
+`search.context_pack` or `search.context_export` to inspect or persist bounded
+adjacent context.
+
+`search.conversation` is a read-only workflow helper over the existing
+conversation discovery, corpus search, and selected-result context/export
+primitives. It accepts:
+
+- `query`: required corpus query text
+- `workspace` plus optional `channel_id`: search one known conversation
+- `all_workspaces`, `channel_type`, `name_query`, and `member_query`: discover
+  candidate conversations before searching
+- `conversation_limit`: maximum discovered conversations to search
+- `per_conversation_limit`: maximum result rows per conversation
+- `retrieval_profile`, `mode`, `fusion`, `rerank`, and `rerank_top_n`: the same
+  release-baseline search controls used by `search.corpus`
+- `before` and `after`: context-window sizes copied into returned next-call
+  payloads
+
+The helper builds a message-scoped query with `in:<channel_id>`, calls
+`search.corpus`, filters returned rows back to the selected channel id, and
+returns `action_targets` plus explicit `search.context_pack` and
+`search.context_export` argument payloads. Derived-text attachment hits are not
+treated as conversation-scoped by this helper until the derived-text lane has a
+first-class channel provenance filter.
+
+`permalink.resolve` is read-only and parses Slack archive URLs of the form
+`https://<workspace>.slack.com/archives/<channel>/p<timestamp>?thread_ts=<ts>`.
+It resolves the Slack workspace domain against configured/mirrored workspace
+domains, converts Slack `/p...` timestamps into dotted Slack timestamps, reports
+whether the selected message and thread are mirrored, and returns next-call
+payloads for thread retrieval and context-window inspection.
+
+`thread.get` is read-only and accepts `workspace`, `channel_id`, `thread_ts`,
+optional `selected_ts`, `include_text`, `max_text_chars`, `limit`,
+`include_files`, `hydrate_files`, `hydrate_limit`, `process_ocr`,
+`process_ocr_limit`, `include_derived_text`, `include_ocr`, and
+`max_derived_text_chars`. It
+returns root plus replies in chronological order from the local mirror with
+safe sender labels, transformed display text, raw text when transformation was
+needed, native ids, source refs, action targets, and Slack file metadata where
+available. When derived/OCR evidence is requested, file artifacts also include
+materialization status plus bounded derived-text/OCR payloads or pending/error
+job state. `hydrate_files` is explicit because it may perform bounded Slack file
+downloads; repeated hydrated calls skip already-present files. `process_ocr` is
+also explicit because it may run bounded local OCR work for the selected
+thread's file artifacts.
+
+Explicit thread-scoped artifact work also emits child event journal rows for
+downstream subscribers following `/v1/events/follow`: `slack.file.hydrated`,
+`slack.file.hydration.failed`, `slack.derived_text.ocr.completed`, and
+`slack.derived_text.ocr.failed`. Those event payloads expose workspace, channel,
+thread timestamp, file id, bounded status/error metadata, and local artifact
+metadata when relevant; they do not include file bodies or OCR text.
+
+`thread.from_permalink` combines `permalink.resolve` and `thread.get` into the
+agent-facing one-call workflow. If the permalink resolves but the thread is not
+mirrored, the response still includes the resolution and mirror-status flags so
+the client can report a freshness gap instead of guessing with unrelated
+searches.
+
+Permalink repair is intentionally not exposed as an API or MCP write surface in
+this release. Operators should use the CLI-only
+`slack-mirror messages repair-permalink <url> --json` path for bounded,
+auditable repair when Slack still returns the missing selected reply. The API
+and MCP permalink/thread calls remain read-only projections over persisted
+mirror state.
+
+Thread file evidence fields:
+
+- `artifacts[].materialization.status`
+  - `available`: `localPath` is present and exists on disk
+  - `missing_local_file`: `localPath` is recorded but the file is not present
+  - `not_materialized`: Slack Mirror has file metadata but no local artifact path
+- `artifactEvidence.hydration`: bounded summary for explicit file hydration,
+  including requested/scanned/attempted/downloaded/skipped/failed counts and
+  per-file status entries
+- `artifactEvidence.ocrProcessing`: bounded summary for explicit thread-scoped
+  OCR processing, including jobs/processed/skipped/errored counts and source ids
+- `artifacts[].derivedText.attachment_text`
+- `artifacts[].derivedText.ocr_text`
+
+Each requested derived-text kind reports either `status: available` with
+extractor, confidence, generated timestamp, bounded `text`, truncation metadata,
+and source local path, or the current derived-text job status/error when text is
+still pending, skipped, or failed. This is the supported agent path for
+artifact-backed thread evidence before falling back to browser Slack or raw
+Slack Web API file reads.
+
+## Frontend Auth
+
+API only:
+
+- `GET /auth/status`
+- `GET /auth/session`
+- `GET /auth/sessions`
+- `POST /auth/register`
+- `POST /auth/login`
+- `POST /auth/logout`
+- `POST /auth/sessions/{id}/revoke`
+- `GET /login`
+- `GET /register`
+- `GET /`
+- `GET /settings`
+- `GET /search`
+- `GET /operator`
+- `GET /operator/assets/{path}`
+
+Current semantics:
+
+- this is a bounded local-password baseline for browser-facing surfaces
+- MCP has no equivalent today
+- when frontend auth is enabled:
+  - unauthenticated HTML requests for protected routes redirect to `/login`
+  - unauthenticated protected JSON requests fail with `AUTH_REQUIRED`
+- `POST /auth/register`, `POST /auth/login`, and `POST /auth/logout` require a same-origin `Origin` or `Referer` header and fail with `CSRF_FAILED` otherwise
+- `POST /auth/sessions/{id}/revoke` follows the same same-origin browser rule and only operates on sessions owned by the authenticated user
+- `POST /auth/login` is subject to a bounded failed-login throttle and returns `429 RATE_LIMITED` with retry metadata when the configured threshold is exceeded
+- `GET /auth/session` includes `session.state`, tenant-maintenance write permission booleans, and the same CSRF metadata advertised in `/v1/service-profile`
+- expired or revoked child sessions currently normalize to `state: "unauthenticated"`; there is no role-based insufficient-permission state yet
+- same-origin child-session writes do not require a CSRF token, nonce, or custom header; the required CSRF check is a matching `Origin` or `Referer`
+- protected routes currently include:
+  - `/`
+  - `/exports/*`
+  - `/operator`
+  - `/operator/assets/*`
+  - `/v1/exports*`
+  - `/search`
+  - `/runtime/reports*`
+  - `/v1/runtime/reports*`
+  - `/v1/runtime/status`
+  - `/v1/runtime/live-validation`
+
+Important fields for `/auth/status`:
+
+- `enabled`
+- `allow_registration`
+- `registration_allowlist`
+- `registration_allowlist_count`
+- `registration_mode`
+- `cookie_name`
+- `cookie_secure_mode`
+- `session_days`
+- `session_idle_timeout_seconds`
+- `login_attempt_window_seconds`
+- `login_attempt_max_failures`
+- `user_count`
+- `registration_open`
+
+Important fields for `/auth/session`, `/auth/register`, and `/auth/login`:
+
+- `authenticated`
+- `user_id`
+- `username`
+- `display_name`
+- `session_id`
+- `auth_source`
+- `expires_at`
+
+Important fields for `/auth/sessions`:
+
+- `session_id`
+- `auth_source`
+- `created_at`
+- `last_seen_at`
+- `expires_at`
+- `revoked_at`
+- `active`
+- `expired`
+- `idle_expired`
+
+`/` is the canonical browser landing page when frontend auth is enabled. It is an HTML-only authenticated view over the existing runtime-status, runtime-report, and export-manifest surfaces.
+
+`/settings` is the browser-facing account/settings page for the same frontend-auth seam. It is an authenticated HTML view over:
+
+- current frontend-auth policy
+- registration allowlist state
+- auth-governance policy such as session lifetime, idle timeout, and login-throttle settings
+- current-user browser sessions
+- revoke actions backed by `POST /auth/sessions/{id}/revoke`
+
+`/search` is the authenticated browser search page for the shipped corpus-search contract. It currently provides:
+
+- workspace-scoped or all-workspace corpus search over the existing API routes
+- browser controls for search mode, result limit, derived-text kind, and derived-text source kind
+- bounded previous/next pagination backed by the same `limit` and `offset` API parameters
+- page-position and result-range display backed by API `total` counts
+- browser-visible workspace readiness context when searching one workspace
+- URL-backed search state so the current browser query can be reloaded or shared
+- stable JSON detail destinations for message and derived-text hits, backed by repo-owned API routes rather than a second browser viewer contract
+
+`/register` remains the browser registration entrypoint, and now surfaces any configured frontend-auth registration allowlist directly in the page copy.
+
+`/login` now uses the same identity language and labels the sign-in field as `Email or username`.
+
+## Runtime Reports
+
+API:
+
+- `GET /v1/runtime/reports`
+- `GET /v1/runtime/reports/{name}`
+- `GET /v1/runtime/reports/latest`
+- `POST /v1/runtime/reports`
+- `POST /v1/runtime/reports/{name}/rename`
+- `DELETE /v1/runtime/reports/{name}`
+- `GET /runtime/reports`
+- `GET /runtime/reports/{name}`
+- `GET /runtime/reports/latest`
+- `GET /runtime/reports/{name}.latest.html`
+- `GET /runtime/reports/{name}.latest.md`
+- `GET /runtime/reports/{name}.latest.json`
+
+Browser manager behavior on `/runtime/reports`:
+
+- report creation uses configured publish-origin choices instead of a raw base-URL text field
+- the page exposes guided name presets plus a timestamped default
+- the report table shows compact tenant content-drain readiness from each snapshot manifest, including tenant count, pending tenant count, and error count
+- rename is an inline row action, not a prompt dialog
+- successful report rename and delete now update the page inline instead of forcing a full reload
+
+Browser manager behavior on `/exports`:
+
+- workspace and channel choices come from the existing mirrored-state API, not raw free-text entry
+- the page now includes browser-side channel filtering for larger workspaces
+- filtering stays bounded to the already-loaded valid channel list and does not introduce a separate search contract
+- export rename is now an inline row action instead of a prompt dialog
+- successful export rename and delete now update the page inline instead of forcing a full reload
+
+MCP:
+
+- `runtime.report.latest`
+
+Named report browsing remains API-only. MCP now exposes the freshest managed runtime report manifest for the common “latest snapshot” case.
+
+Important fields for the JSON listing/detail routes:
+
+- `schema_version`
+- `generated_at`
+- `producer`
+  - `name`
+  - `version`
+- `provenance`
+  - `runtime_status_source`
+  - `live_validation_source`
+- `name`
+- `base_url`
+- `fetched_at`
+- `status`
+- `summary`
+- `validation`
+  - `status`
+  - `summary`
+  - `failure_count`
+  - `warning_count`
+  - `failure_codes`
+  - `warning_codes`
+  - `workspace_count`
+- `content_drain`
+  - `tenant_count`
+  - `ready_count`
+  - `blocked_count`
+  - `pending_count`
+  - `error_count`
+  - `rows`
+- `html_url`
+- `markdown_url`
+- `json_url`
+
+Create semantics for `POST /v1/runtime/reports`:
+
+- request fields:
+  - `base_url`
+  - `name`
+  - optional `timeout`
+- response:
+  - `ok`
+  - `report`
+
+Update semantics for `POST /v1/runtime/reports/{name}/rename`:
+
+- bounded to rename only
+- request fields:
+  - `name`
+- response:
+  - `ok`
+  - `report`
+
+Delete semantics for `DELETE /v1/runtime/reports/{name}`:
+
+- response:
+  - `ok`
+  - `deleted`
+  - `name`
+
+Important fields for `runtime.report.latest`:
+
+- `ok`
+- `report`
+  - `schema_version`
+  - `generated_at`
+  - `producer`
+  - `provenance`
+  - `name`
+  - `base_url`
+  - `fetched_at`
+  - `status`
+  - `summary`
+  - `validation`
+  - `content_drain`
+
+`/runtime/reports/{name}` serves the latest HTML snapshot directly for human review.
+`/runtime/reports` now serves a browser management page over the currently available managed snapshots, with the freshest report highlighted and linked through `/runtime/reports/latest`, compact tenant content-drain readiness in the report table, plus bounded create/rename/delete controls backed by the same runtime-report CRUD API routes. Successful create, rename, and delete mutations now update the page inline instead of forcing a full page reload.
+`/runtime/reports/latest` serves the freshest available HTML snapshot regardless of its snapshot name, and `/v1/runtime/reports/latest` returns the matching manifest.
+
+## Exports
+
+API:
+
+- `GET /v1/service-profile`
+- `GET /v1/events`
+- `GET /v1/events/follow`
+- `GET /v1/context-window`
+- `GET /v1/workspaces/{workspace}/channels`
+- `GET /v1/exports`
+- `GET /v1/exports/{export_id}`
+- `POST /v1/exports`
+- `POST /v1/exports/{export_id}/rename`
+- `DELETE /v1/exports/{export_id}`
+- `GET /exports/{export_id}`
+- `GET /exports/{export_id}/{filepath}`
+- `GET /exports/{export_id}/{filepath}/preview`
+
+Current semantics:
+
+- `GET /v1/service-profile` returns a machine-readable child-service profile for parent UX layers such as Receipts
+- `GET /v1/events` returns a cursor-backed page of Slack-owned committed product events
+- `GET /v1/events/status` returns child-owned event readiness and watermark metadata
+- `GET /v1/events/follow` returns a bounded long-poll page over Slack-owned journal events
+- `GET /v1/context-window` returns a cursor-backed Slack-owned message context stream for a selected search result
+- `GET /v1/workspaces/{workspace}/channels` provides valid mirrored channel choices for the browser export picker
+- `POST /v1/exports` supports bounded managed bundle creation for `kind=channel-day` and `kind=selected-results`
+- export updates are intentionally bounded to rename only
+- the API remains a thin wrapper over the existing managed bundle ownership in `slack_mirror.exports`
+
+Important fields for `/v1/service-profile`:
+
+- `service: slack`
+- `serviceKey: slack`
+- `displayName`
+- `productName: Slack Receipts`
+- `legacyProductName: Slack Mirror`
+- `legacyProjectName: Slack Export`
+- `version`
+- `renameTarget`
+- `repoRenameTarget`
+- `compatibility`
+  - `pythonPackage: slack_mirror`
+  - `preferredCli: slack-receipts`
+  - `legacyCli: slack-mirror`
+  - `preferredManagedCli: slack-receipts-user`
+  - `legacyManagedCli: slack-mirror-user`
+  - `preferredMcpWrapper: slack-receipts-mcp`
+  - `legacyMcpWrapper: slack-mirror-mcp`
+  - `statePathsCanonical: slack-receipts`
+  - `systemdUnitsCanonical: slack-receipts`
+- `auth`
+  - `mode: child-session`
+  - `childSessionApi`
+  - `sessionUrl`
+  - `loginUrl`
+  - `logoutUrl`
+  - `unauthenticatedCode`
+- `providers`
+- `capabilities`
+  - `health`
+  - `search`
+  - `evidenceDetail`
+  - `contextWindow`
+  - `contextPack`
+  - `reportCreate`
+  - `artifactList`
+  - `artifactOpen`
+  - `artifactRename`
+  - `artifactDelete`
+  - `guestGrants`
+  - `eventCursorRead`
+  - `eventDescriptors`
+  - `eventStatus`
+  - `eventFollow`
+  - `managementActions`
+- `routes`
+- `events`
+- `eventDescriptors`
+- `tenantMaintenance`
+- `guestGrants`
+- `queryOperators`
+- `artifacts`
+- `sourceMetadata`
+- `ui`
+
+The profile route is intentionally readable without a child session so a parent BFF can discover Slack Receipts capabilities before deciding whether to show sign-in, search, report, and artifact-management controls. Slack Mirror remains the compatibility identity for existing imports, wrappers, state paths, and user services during the staged cutover. Protected operational routes still enforce the child-session policy.
+
+`tenantMaintenance` describes the Slack-owned tenant settings contract for
+parent UX layers. It includes list/status route templates, the redacted tenant
+action field name, and action descriptors for scaffold creation, credential
+installation, activation, live-sync start/restart/stop, bounded initial sync,
+draining attachment/OCR content processing, bounded embedding processing, and
+guarded retirement. Concrete tenant status responses from `/v1/tenants` and
+`/v1/tenants/{tenant}` include `maintenance_actions` entries with:
+
+- `enabled` and `disabled_reason`
+- `dangerous`
+- `requires_confirmation`
+- `confirmation_value` when typed confirmation is required
+- concrete `path`, HTTP `method`, and default `body_template`
+
+Credential presence remains redacted. Tenant mutations remain child-session and
+same-origin protected; Receipts should call these routes through the child
+service rather than scrape `/settings/tenants` or duplicate Slack lifecycle
+logic.
+
+Tenant status distinguishes initial history sync from post-sync processing.
+`backfill_status.label: "syncing"` is reserved for tenants that have not yet
+established durable reconcile state and still have bounded sync work in
+progress. Once reconcile state exists, pending derived-text or embedding jobs
+are background content-processing backlog and should not be rendered as a
+blocked initial-sync state. Concrete tenant responses expose that backlog in
+`processing_status`, including embedding and derived-text pending/error counts.
+Concrete tenant maintenance action labels follow that distinction: the backfill
+route is labeled `Run initial sync` before initial reconcile state exists and
+`Run bounded backfill` once the tenant is already established.
+When pending derived-text jobs exist, concrete tenant responses can advertise
+`process_content`, a draining `POST /v1/tenants/{tenant}/process-content`
+action with a default body of
+`{"kind": "all", "limit": 100, "job_timeout_seconds": 10, "ocr_job_timeout_seconds": 60, "max_text_chars": 1000000, "max_passes": 1000}`.
+That action drains queued attachment-text and OCR-derived text jobs only;
+embedding backlog remains visible as processing status and semantic readiness
+rather than being hidden behind the same button. When pending embedding jobs
+exist, concrete tenant responses can advertise `process_embeddings`, a bounded
+`POST /v1/tenants/{tenant}/process-embeddings` action with a default body of
+`{"model": "{configured_semantic_model}", "limit": 200}`. That action drains
+queued message-embedding jobs for the configured semantic model and leaves
+derived-text extraction under `process_content`.
+
+### Tenant Maintenance Execution Handshake
+
+`tenantMaintenance.executionContract` is the Slack-owned handshake for parent
+UX layers that want to execute tenant maintenance actions.
+
+Receipts should treat only concrete per-tenant `maintenance_actions` entries
+from `/v1/tenants` or `/v1/tenants/{tenant}` as executable. Profile-level
+`tenantMaintenance.actions` entries are non-executable templates used for
+capability discovery and labeling.
+
+Stable per-tenant action fields:
+
+- `id`
+- `label`
+- `method`
+- `path`
+- `enabled`
+- `disabled_reason`
+- `dangerous`
+- `requires_confirmation`
+- `confirmation_value` when typed confirmation is required
+- `body_template`
+- `executable_source`
+- `transport_mode`
+- `response_shape`
+- `idempotency`
+- `refresh_recommendation`
+
+Transport and session rules:
+
+- dispatch through the parent BFF must use root-relative child paths under the
+  Slack child service, for example `/api/children/slack/v1/tenants/{tenant}/live`
+- absolute URLs, protocol-relative URLs, and service-escaping paths must be
+  rejected by the parent before dispatch
+- authenticated child-session cookies are sufficient for writes
+- the child requires same-origin `Origin` or `Referer` validation and returns
+  `CSRF_FAILED` when that validation fails
+- no CSRF token, nonce, or custom header is required at this layer
+
+Idempotency rules:
+
+- Slack tenant maintenance writes do not currently support a child-owned
+  idempotency key, header, or body field
+- Receipts must keep one dispatch in flight, suppress duplicate clicks, and
+  refresh tenant status before retrying
+- duplicate or stale actions should be rendered from the refreshed
+  `maintenance_actions` state rather than guessed from parent-side state
+
+Successful tenant mutation responses include the existing action-specific
+fields plus:
+
+- `operation.schema: "tenant_maintenance_operation_v1"`
+- `operation.service: "slack"`
+- `operation.kind: "tenant_maintenance"`
+- `operation.action`
+- `operation.tenant`
+- `operation.status`
+- `operation.operation_id`, currently `null` unless a future action has a
+  durable child operation id
+- `operation.idempotency.supported`, currently `false`
+- `operation.message`
+- `operation.safe_to_persist`
+- top-level `refresh` with recommended follow-up routes and polling guidance
+
+Error responses use the shared service error envelope. Parent UIs should branch
+on these stable categories:
+
+- `AUTH_REQUIRED`
+- `CSRF_FAILED`
+- `INVALID_ARGUMENT`
+- `NOT_FOUND`
+- `CONFLICT`
+- `SERVICE_UNAVAILABLE`
+- `INTERNAL`
+
+Post-action refresh rules:
+
+- refresh `/v1/tenants` after every action
+- refresh `/v1/tenants/{tenant}` when the tenant still exists
+- refresh `/v1/runtime/status` after activation, live-sync start/restart/stop,
+  initial sync, and retirement actions
+- honor `refresh.poll` for asynchronous or runtime-affecting actions
+
+`ui.surfaceOwnership` is the boundary map for shared parent interfaces:
+
+- `parentOwned`: shared Receipts UX surfaces such as search workbench, report
+  creation, guest links, evidence inspector, and live view
+- `childOwned`: Slack-owned auth/session, tenant settings, runtime operations,
+  sync state, and workspace management surfaces
+- `experimental`: child preview pages that are useful proving grounds but are
+  not durable parent integration targets; `/operator` is currently listed here
+  with `durableIntegrationTarget: false`
+
+`guestGrants` describes which Slack-owned routes can honor a parent guest-grant
+assertion. Slack Mirror currently marks only export/report artifact read routes
+as guest-safe:
+
+- `GET /exports/{exportId}`
+- `GET /exports/{exportId}/{path}`
+- `GET /exports/{exportId}/{path}/preview`
+- `GET /v1/exports/{exportId}`
+
+Each guest-safe route includes `guestSafe: true`, `honorsAssertion: true`, and
+`targetKinds` containing `artifact` and `report-artifact`. Listing, search,
+creation, rename, deletion, tenant, runtime, and workspace routes remain
+local-only child-session/operator routes. Unsigned assertions are accepted for
+local development when no shared secret is configured; `hmac-sha256` is the
+recommended production signature mode.
+
+`GET /v1/events` accepts:
+
+- `tenant`: Slack Mirror workspace name
+- `account_key`: equivalent workspace/account filter when a parent uses provider-neutral naming
+- `after`: opaque Slack Mirror cursor from a prior event page
+- `limit`: bounded page size, capped by the service
+- `service_kind`: optional `slack` or `slack-mirror`
+- `event_type`: exact event type or comma-separated event types
+- `privacy`: exact privacy class or comma-separated privacy classes
+- `actor_ref`: child-owned actor label, name, or native user id filter; `actor`
+  is accepted as an alias
+- `actor_user_id`: native Slack user id filter; `user_id` is accepted as an
+  alias
+- `channel_ref`: child-owned channel label, name, or native channel id filter;
+  `channel` is accepted as an alias
+- `channel_id`: native Slack channel id filter
+- `subject_kind`: stable event subject kind such as `slack-message`,
+  `slack-file`, or `slack-export`
+- `subject_id`: stable child-owned subject id such as
+  `message|default|C123|1712870400.000100`
+
+The first event surface is read-only and derives committed product events from
+durable Slack Mirror state rather than exposing raw webhook/socket transport
+rows. It now combines two child-owned sources:
+
+- an append-only child event journal for live-intake lifecycle events
+- derived current-state events for existing mirrored messages, files, and
+  managed export artifacts
+
+Current journal-backed event families include:
+
+- `slack.message.created`
+- `slack.thread_reply.created`
+- `slack.message.changed`
+- `slack.message.deleted`
+- `slack.reaction.added`
+- `slack.reaction.removed`
+- `slack.channel.member_joined`
+- `slack.channel.member_left`
+- `slack.user.profile.changed`
+- `slack.outbound.message.sent`
+- `slack.outbound.thread_reply.sent`
+- `slack.outbound.write.failed`
+- `slack.runtime.live_sync.changed`
+- `slack.sync.initial_sync.requested`
+
+Current derived current-state event families include:
+
+- `slack.message.observed`
+- `slack.thread_reply.observed`
+- `slack.file.linked`
+- `slack.export.created`
+- `slack.export.renamed`
+- `slack.export.deleted`
+
+The response includes `events`, `nextCursor`, `hasMore`, `count`, `status`, and
+`service: slack`. It also includes snake_case aliases such as `next_cursor`,
+`has_more`, and per-row `event_type`, `occurred_at`, `recorded_at`,
+`source_refs`, and `native_ids` so parent UX layers do not have to parse
+Slack-specific field casing. Cursors are opaque to Receipts and other parent UX
+layers. When a supplied `after` cursor is older than the current derived event
+window, the route returns `status: stale-cursor`, `staleCursor: true`, and
+`recovery.action: reset_cursor`; parent readers should resume from
+`oldestCursor` or refresh from `latestCursor`. `capabilities.eventCursorRead` is true when this route is present.
+
+`GET /v1/events/follow` accepts the same filters as `/v1/events`, plus
+`timeout_ms`. It is a bounded long-poll JSON surface over the append-only child
+event journal only; it does not replay derived current-state rows such as
+`slack.message.observed`. The service caps the wait to 30 seconds. The response
+shape matches `/v1/events` and adds:
+
+- `follow.mode`: `bounded-long-poll`
+- `follow.journal_only`: true
+- `follow.timeout_ms`: the effective wait budget
+
+`capabilities.eventFollow` is true when this route is available. Parent
+subscribers should keep their own subscription definitions and bookmarks, pass
+Slack-owned opaque cursors back as `after`, and treat an empty follow response
+as a timeout rather than an error.
+
+`GET /v1/events/status` accepts the same `tenant`, `account_key`,
+`service_kind`, `event_type`, `privacy`, actor, channel, and subject filters as
+`/v1/events`. The response includes:
+
+- `status`: `current` when matching events exist, `filtered-empty` when events
+  exist but filters match none, or `empty` when no events exist for the selected
+  scope
+- `event_count`
+- `event_family_counts`
+- `latest_event_id`
+- `latest_recorded_at`
+- `latest_occurred_at`
+- `latest_cursor`
+- `oldest_event_id`
+- `oldest_recorded_at`
+- `oldest_cursor`
+- `cursor_retention`
+- `recovery`
+- `watermarks`: per-event-type count and latest cursor metadata
+- `descriptors`: the current stable event descriptor list
+
+Receipts owns full-stream UX, subscriptions, and parent-side subscriber
+bookmarks. Slack Mirror owns Slack-native event capture, cursor identity,
+filter vocabulary, and redaction. The first follow contract is bounded
+long-poll rather than SSE so Receipts can consume it through the existing child
+adapter/proxy path. Operational journal rows currently cover outbound write
+results and tenant live-sync/backfill requests; remaining planned journal
+families include richer channel lifecycle events and any additional
+Slack-native status events the service starts ingesting.
+
+`GET /v1/service-profile` advertises `capabilities.eventDescriptors: true` and
+`capabilities.eventStatus: true` when this metadata is available. Current
+descriptors include label, privacy class, subject kind, payload stability,
+redaction note, and safe role hints for each emitted event family.
+
+`GET /v1/context-window` accepts:
+
+- `result_id`: a message `action_target.id`, for example `message|default|C123|1712870400.000100`
+- `direction`: `around`, `before`, or `after`
+- `cursor`: opaque Slack Mirror cursor for `before` and `after`
+- `limit`: bounded page size, capped by the service
+- `include_text`: optional `0`/`false`/`no` to omit message text
+- `max_text_chars`: optional per-item text cap
+
+The response is shaped for parent UX layers such as Receipts:
+
+- `service: slack`
+- `resultId`
+- `streamId`
+- `streamLabel`
+- `streamKind: slack-channel | slack-thread`
+- `tenantLabel`
+- `scopeLabel`
+- `selectedItemId`
+- `items[]`
+  - `text` is the Receipts-facing display lane and may include safe user labels
+    plus common Unicode emoji aliases
+  - `rawText` and `textRendering` are present when Slack-native mrkdwn was
+    transformed for display
+  - `nativeIds`, `sourceRefs`, `sender`, and `actionTarget` preserve Slack-owned
+    provenance and stable expansion handles
+- `pageInfo.hasBefore`
+- `pageInfo.hasAfter`
+- `pageInfo.beforeCursor`
+- `pageInfo.afterCursor`
+
+Cursor values are intentionally opaque. Receipts and other parents should pass them back unchanged instead of parsing Slack timestamps, thread roots, channel IDs, or SQLite ordering.
+
+Direct Slack permalink routes:
+
+- `GET /v1/permalink/resolve?url=<slack-url>` returns the same permalink
+  resolution fields as the MCP `permalink.resolve` tool.
+- `GET /v1/workspaces/{workspace}/threads/{channel_id}/{thread_ts}` returns the
+  same thread payload as MCP `thread.get`; optional query fields are
+  `selected_ts`, `include_text`, `max_text_chars`, `limit`, `include_files`,
+  `hydrate_files`, `hydrate_limit`, `process_ocr`, `process_ocr_limit`,
+  `include_derived_text`, `include_ocr`, and `max_derived_text_chars`.
+
+Receipts guest-grant artifact reads:
+
+- Slack Mirror accepts Receipts guest-grant assertions only on `GET /exports/{exportId}`, `GET /exports/{exportId}/{path}`, preview reads under the same bundle path, and `GET /v1/exports/{exportId}`.
+- List, create, rename, delete, runtime-report, workspace, tenant, and search routes still require the normal Slack Mirror child session when frontend auth is enabled.
+- Unsigned guest-grant assertions are accepted for trusted local development when no shared secret is configured.
+- If `SLACK_MIRROR_RECEIPTS_CHILD_GRANT_SHARED_SECRET` or `RECEIPTS_CHILD_GRANT_SHARED_SECRET` is configured, Slack Mirror requires `x-receipts-guest-grant-signature-mode: hmac-sha256` and verifies the signature before bypassing the child-session cookie requirement.
+- Slack Mirror does not receive raw guest tokens or token hashes. It uses grant ids, target ids, token ids, timestamps, and nonce values only as forwarded assertion metadata.
+
+Required guest-grant headers:
+
+- `x-receipts-request-mode: guest-grant`
+- `x-receipts-child-service: slack`
+- `x-receipts-guest-grant-id`
+- `x-receipts-guest-grant-target-id`
+- `x-receipts-guest-grant-target-kind: report-artifact | artifact`
+- `x-receipts-guest-grant-token-id`
+- `x-receipts-guest-grant-scope`
+- `x-receipts-guest-grant-audience`
+- `x-receipts-guest-grant-ts`
+- `x-receipts-guest-grant-nonce`
+- `x-receipts-guest-grant-signature-mode: unsigned | hmac-sha256`
+- `x-receipts-guest-grant-signature` when signed
+
+Important fields for export listing/detail routes:
+
+- `schema_version`
+- `generated_at`
+- `producer`
+  - `name`
+  - `version`
+- `provenance`
+  - `metadata_source`
+  - `url_contract_source`
+- `export_id`
+- `kind`
+- `title`
+- `workspace`
+- `channel`
+- `channel_id`
+- `day`
+- `item_count`
+- `resolved_count`
+- `unresolved_count`
+- `default_audience`
+- `bundle_urls`
+- `bundle_url`
+- `file_count`
+- `attachment_count`
+- `files`
+  - `relpath`
+  - `role`
+  - `content_type`
+  - `size_bytes`
+  - `download_urls`
+  - `preview_urls`
+  - `download_url`
+  - `preview_url`
+
+Important fields for `GET /v1/workspaces/{workspace}/channels`:
+
+- `channel_id`
+- `name`
+- `channel_class`
+- `message_count`
+- `latest_message_ts`
+- `latest_message_day`
+
+Channel/day create semantics for `POST /v1/exports`:
+
+- request fields:
+  - `kind: channel-day`
+  - `workspace`
+  - `channel`
+  - `day`
+  - optional `tz`
+  - optional `audience`
+  - optional `export_id`
+- response:
+  - `ok`
+  - `export`
+
+Selected-result create semantics for `POST /v1/exports`:
+
+- request fields:
+  - `kind: selected-results`
+  - `targets`: array of corpus-search `action_target` objects
+  - optional `before`
+  - optional `after`
+  - optional `include_text`
+  - optional `max_text_chars`
+  - optional `audience`
+  - optional `export_id`
+  - optional `title`
+- response:
+  - `ok`
+  - `export`
+
+Selected-result export bundles contain:
+
+- `selected-results.json`: the neutral selected-result artifact containing the generated context pack
+- `index.html`: a human-readable selected-result report rendered from that neutral JSON artifact
+- `manifest.json`: the same schema-versioned export manifest used by other managed bundles
+
+The HTML report shows selected items, target identity, resolved/unresolved status, message context, derived-text chunk context, and linked Slack messages when present. It also includes a sticky summary/action header, item anchors, target JSON copy affordances, collapsible context sections, and print-friendly styling for browser save-to-PDF. If `include_text=false`, the report still renders the selected structure and explicitly marks text as omitted instead of looking empty.
+
+Update semantics for `POST /v1/exports/{export_id}/rename`:
+
+- bounded to rename only
+- request fields:
+  - `export_id`
+  - optional `audience`
+- response:
+  - `ok`
+  - `export`
+
+Delete semantics for `DELETE /v1/exports/{export_id}`:
+
+- response:
+  - `ok`
+  - `deleted`
+  - `export_id`
+
+`/exports` now serves a browser management page over the managed export bundles, with bounded channel-day create plus rename/delete controls backed by the same export CRUD API routes. The create form now uses dependent workspace/channel selectors populated from `/v1/workspaces/{workspace}/channels` instead of raw free-text channel entry, and successful create/rename/delete mutations update the page inline instead of forcing a full page reload.
+
+## Runtime Status
+
+API:
+
+- `GET /v1/runtime/status`
+
+MCP:
+
+- `runtime.status`
+
+This is the lightweight managed-runtime status surface. It is intended for dashboards, probes, and operator scripts that need runtime artifact/service presence plus the latest persisted reconcile summary, without running the full live validation gate.
+
+Important fields:
+
+- `ok`
+- `wrappers_present`
+- `mcp_ready`
+- `mcp_multi_client_ready`
+- `mcp_smoke_error`
+- `mcp_multi_client_error`
+- `mcp_multi_client_clients`
+- `api_service_present`
+- `config_present`
+- `db_present`
+- `cache_present`
+- `rollback_snapshot_present`
+- `services`
+- `reconcile_workspaces`
+  - `name`
+  - `state_present`
+  - `auth_mode`
+  - `iso_utc`
+  - `age_seconds`
+  - `attempted`
+  - `downloaded`
+  - `warnings`
+  - `failed`
+
+Current semantics:
+
+- `wrappers_present` means the managed wrapper launchers are present on disk
+- `mcp_ready` means the managed `slack-mirror-mcp` wrapper successfully answered a real MCP health request over stdio
+- `mcp_smoke_error` carries the latest wrapper-probe failure detail when `mcp_ready` is false
+- `mcp_multi_client_ready` means the managed `slack-mirror-mcp` wrapper passed a bounded concurrent readiness probe across multiple simultaneous wrapper launches
+- `mcp_multi_client_error` carries the latest concurrent-probe failure detail when `mcp_multi_client_ready` is false
+- `mcp_multi_client_clients` records how many simultaneous wrapper launches were used for the bounded concurrent probe
+
+## Live Validation
+
+API:
+
+- `GET /v1/runtime/live-validation`
+
+MCP:
+
+- `runtime.live_validation`
+
+Both return the same shared validation payload with:
+
+- `ok`
+- `status`
+  - `pass`
+  - `pass_with_warnings`
+  - `fail`
+- `summary`
+- `failure_count`
+- `warning_count`
+- `failure_codes`
+- `warning_codes`
+- `workspaces`
+  - `name`
+  - `event_errors`
+  - `embedding_errors`
+  - `event_pending`
+  - `embedding_pending`
+  - `stale_channels`
+  - `stale_warning_suppressed`
+  - `active_recent_channels`
+  - `shell_like_zero_message_channels`
+  - `unexpected_empty_channels`
+  - `reconcile_state_present`
+  - `reconcile_state_age_seconds`
+  - `reconcile_auth_mode`
+  - `reconcile_iso_utc`
+  - `reconcile_attempted`
+  - `reconcile_downloaded`
+  - `reconcile_warnings`
+  - `reconcile_failed`
+  - `failure_codes`
+  - `warning_codes`
+
+Human-readable `lines` remain present for operators, but automation should prefer the structured fields above.
+
+## Corpus Search
+
+API:
+
+- `GET /v1/workspaces/{workspace}/search/corpus`
+- `GET /v1/search/corpus`
+- `GET /v1/workspaces/{workspace}/messages/{channel_id}/{ts}`
+- `GET /v1/workspaces/{workspace}/derived-text/{source_kind}/{source_id}?kind={derivation_kind}`
+- `GET /v1/workspaces/{workspace}/derived-text/{source_kind}/{source_id}?kind={derivation_kind}&extractor={extractor}`
+
+MCP:
+
+- `search.corpus`
+
+Both expose the same shared corpus-search result model over:
+
+- messages
+- attachment-derived text
+- OCR-derived text
+
+Important request fields:
+
+- `query`
+  - message-lane operators include `from:`, `participant:`, `user:`, `in:`, `channel:`, `source:`, `after:`, `since:`, `before:`, `until:`, `on:`, `has:link`, and `is:thread`/`is:reply`/`is:edited`
+  - temporal operators accept numeric Slack timestamps plus UTC ISO dates/datetimes; `on:YYYY-MM-DD` expands to that UTC day
+  - attachment/file-lane operators include `has:attachment`, `filename:`, `mime:`, `extension:`/`ext:`, and `attachment-type:`
+  - message search applies attachment operators through persisted message-file links
+  - derived-text search applies attachment operators to extracted file/canvas text rows
+  - when message-lane operators are present, corpus search suppresses unfiltered derived-text hits rather than returning attachment/OCR rows outside those message constraints
+  - mixed message-lane plus attachment/file-lane constraints can return message rows when linked file metadata satisfies the attachment constraints
+- `workspace`
+  - required for workspace-scoped search unless `all_workspaces=true`
+- `all_workspaces`
+  - optional boolean for cross-workspace search through MCP or the top-level API route
+- `mode`
+  - `lexical`
+  - `semantic`
+  - `hybrid`
+- `retrieval_profile`
+  - optional named `search.retrieval_profiles` profile for API and MCP corpus search
+  - when set, the profile's provider, model, weights, and rerank settings are used through the shared service layer
+  - release-safe value: `baseline`
+  - stronger profiles such as `local-bge` require the corresponding optional local semantic dependencies and completed rollout coverage
+- `limit`
+- `offset`
+- `kind`
+  - optional derived-text filter
+- `source_kind`
+  - optional derived-text source filter
+
+Important result fields:
+
+- `result_kind`
+  - `message`
+  - `derived_text`
+- `text`
+- `matched_text`
+- `snippet_text`
+- `text_rendering`
+  - present when Slack Mirror transformed Slack-native display text for a
+    guest-safe lane
+  - current transformations include user mention labels and common Unicode
+    emoji aliases
+- `chunk_index`
+- `start_offset`
+- `end_offset`
+- `source_label`
+- `workspace`
+- `workspace_id`
+- `channel_id`
+- `channel_name`
+- `user_id`
+- `user_label`
+  - human-facing display label for the sender when Slack Mirror has user
+    profile data; absent or null when no profile-backed label is known
+- `user_name`
+  - Slack username/handle when available
+- `user_display_name`
+  - Slack profile display name when available
+- `action_target`
+- `_source`
+  - `lexical`
+  - `semantic`
+  - `hybrid`
+- `_lexical_score`
+- `_semantic_score`
+- `_hybrid_score`
+- `_explain`
+
+`action_target` is the stable selection contract for downstream workflows. It is additive to the display-oriented row fields and should be preferred by API, MCP, browser, and agent clients that need to stage search hits for later export, reporting, or actions.
+
+Selected search candidates can be expanded before export/report rendering with:
+
+- CLI: `slack-mirror search context-pack --targets-json ...`
+- API: `POST /v1/search/context-pack`
+- MCP: `search.context_pack`
+
+The context-pack request accepts:
+
+- `targets`: array of `action_target` objects
+- `before`: bounded message/chunk context count before each selected target
+- `after`: bounded message/chunk context count after each selected target
+- `include_text`: whether to include message and chunk text
+- `max_text_chars`: per-context-item text cap
+
+The context-pack response is intentionally a handoff artifact, not a rendered export. Message targets resolve to before/hit/after message context in the same workspace and channel. Derived-text targets resolve to bounded chunk context and, for file-backed derived text, linked Slack messages through the persisted message-file edge table.
+
+Selected search candidates can also be persisted as a managed neutral export artifact with:
+
+- CLI: `slack-mirror search context-pack --targets-json ... --managed-export`
+- API: `POST /v1/exports` with `kind=selected-results`
+- MCP: `search.context_export`
+- Browser: select individual candidates or all visible selectable candidates on the authenticated `/search` page, then create a selected-result report from the in-page tray
+
+The selected-result export request uses the same target and context-window fields as the context-pack request, plus optional `audience`, `export_id`, and `title`. The created bundle preserves the context pack in `selected-results.json` and renders a first-pass HTML report at `/exports/{export_id}`. DOCX/PDF rendering remains a later layer on top of this neutral artifact.
+
+Message action targets include:
+
+- `version`
+- `kind: message`
+- `id`
+- `workspace`
+- `workspace_id`
+- `channel_id`
+- `channel_name`
+- `ts`
+- `thread_ts`
+- `user_id`
+- `selection_label`
+
+Derived-text action targets include:
+
+- `version`
+- `kind: derived_text`
+- `id`
+- `workspace`
+- `workspace_id`
+- `derived_text_id`
+- `source_kind`
+- `source_id`
+- `source_label`
+- `derivation_kind`
+- `extractor`
+- `chunk_index`
+- `start_offset`
+- `end_offset`
+- `selection_label`
+
+Current semantics:
+
+- lexical-first hybrid ranking is the shipped baseline
+- message results reuse the existing message-search path
+- derived-text results reuse shared-core `derived_text` rows
+- long derived-text rows may be retrieved through chunk-level matches but still resolve to one owning derived-text result
+- `matched_text` and `snippet_text` are best-match snippet fields for long
+  documents and OCR-heavy attachments; for Slack messages, `matched_text` is the
+  Receipts-facing display lane and may render `<@U...>` mentions as safe labels
+  plus common `:emoji:` aliases as Unicode while preserving raw Slack `text`
+- selected search candidates should be persisted or handed off using `action_target`, not by scraping labels, snippets, or score fields
+- derived-text semantic scoring currently uses the same local embedding baseline used elsewhere in-repo
+- cross-workspace corpus search is explicit rather than implicit:
+  - CLI uses `--all-workspaces`
+  - API uses `GET /v1/search/corpus`
+  - MCP uses `all_workspaces=true`
+- pagination is bounded and offset-based:
+  - API routes accept `limit` plus `offset`
+  - the current browser page uses previous/next controls over that same contract
+  - the current API also exposes `total` so browser clients can render page and range metadata without inventing a second paging contract
+- the browser uses the read-only message and derived-text detail routes as stronger result destinations without adding a second browser-native viewer contract
+
+Detail route semantics:
+
+- message detail returns one repo-owned message envelope with:
+  - workspace
+  - channel metadata
+  - user label
+  - thread metadata
+  - stored message fields
+  - parsed `raw_json` payload under `message`
+- derived-text detail returns one repo-owned derived-text envelope with:
+  - workspace
+  - source and derivation metadata
+  - stored derived-text fields
+  - parsed `metadata`
+  - chunk rows under `chunks`
+
+## Search Readiness
+
+API:
+
+- `GET /v1/workspaces/{workspace}/search/readiness`
+
+MCP:
+
+- `search.readiness`
+
+Both return one shared machine-readable readiness payload with:
+
+- `workspace`
+- `status`
+  - `ready`
+  - `degraded`
+- `messages`
+  - `count`
+  - `embeddings`
+    - `count`
+    - `pending`
+    - `errors`
+- `derived_text`
+  - `attachment_text`
+    - `count`
+    - `pending`
+    - `errors`
+    - `providers`
+    - `jobs`
+      - `pending`
+      - `done`
+      - `skipped`
+      - `error`
+    - `issue_reasons`
+  - `ocr_text`
+    - `count`
+    - `pending`
+    - `errors`
+    - `providers`
+    - `jobs`
+      - `pending`
+      - `done`
+      - `skipped`
+      - `error`
+    - `issue_reasons`
+
+Current semantics:
+
+- this is a readiness summary, not a quality benchmark
+- `degraded` currently means search corpus state exists but one or more tracked error conditions remain
+- callers should prefer these structured counters over inferring readiness from ad hoc queue inspection
+- provider coverage and issue-reason counts are intended for operator visibility and automation, not as a second quality gate separate from `search.health`
+
+## Search Health
+
+API:
+
+- `GET /v1/workspaces/{workspace}/search/health`
+
+MCP:
+
+- `search.health`
+
+Both return one shared health payload with:
+
+- `workspace`
+- `status`
+  - `pass`
+  - `pass_with_warnings`
+  - `fail`
+- `readiness`
+  - the shared readiness payload
+- `benchmark`
+  - optional benchmark report when a dataset is provided
+- `benchmark_thresholds`
+- `extraction_thresholds`
+- `degraded_queries`
+- `failure_codes`
+- `warning_codes`
+
+Current benchmark gates:
+
+- `BENCHMARK_HIT_AT_3_LOW`
+- `BENCHMARK_HIT_AT_10_LOW`
+- `BENCHMARK_NDCG_AT_K_LOW`
+- `BENCHMARK_LATENCY_P95_HIGH`
+
+Current extraction health gates:
+
+- failures:
+  - `ATTACHMENT_ERRORS_PRESENT`
+  - `OCR_ERRORS_PRESENT`
+- warnings:
+  - `ATTACHMENT_PENDING_HIGH`
+  - `OCR_PENDING_HIGH`
+  - `ATTACHMENT_ISSUES_PRESENT`
+  - `OCR_ISSUES_PRESENT`
+
+Current semantics:
+
+- health is a gate over readiness plus optional benchmark quality checks
+- readiness degradation currently becomes a warning unless benchmark or extraction policy failures also occur
+- benchmark output includes per-query diagnostics through `query_reports`
+- benchmark diagnostics include non-content expected-target evidence such as query terms, exact/source-label coverage ratios, and missing terms
+- `degraded_queries` surfaces the subset of benchmark queries that missed ranking-quality floors or hit-rate expectations
+- benchmark execution is optional but should be used before ranking changes or release decisions that affect search behavior
+
+## Outbound Write Success
+
+API:
+
+- `POST /v1/workspaces/{workspace}/messages`
+- `POST /v1/workspaces/{workspace}/threads/{thread_ref}/replies`
+- `POST /v1/workspaces/{workspace}/reactions`
+
+MCP:
+
+- `messages.send`
+- `threads.reply`
+- `reactions.add`
+- `reactions.remove`
+
+Successful outbound actions return the normalized shared action shape. Important fields:
+
+- `id`
+- `workspace_id`
+- `kind`
+  - `message`
+  - `thread_reply`
+  - `reaction_add`
+  - `reaction_remove`
+- `channel_id`
+- `thread_ts`
+- `status`
+  - `pending`
+  - `sent`
+  - `failed`
+- `idempotency_key`
+- `options`
+  - parsed from stored `options_json`
+- `response`
+  - parsed upstream Slack response when present
+- `error`
+- `idempotent_replay`
+  - `false` for the first successful send/reply
+  - `true` when the action was returned from an existing matching idempotency record
+- `retryable`
+  - `true` for `pending` and `failed`
+  - `false` for `sent`
+
+Semantics:
+
+- callers should send an `idempotency_key` for any write they may retry
+- repeated requests with the same workspace, action kind, and idempotency key return the existing action instead of sending a second Slack write
+- idempotent replay is visible in the returned payload through `idempotent_replay`
+- the result shape is the same whether the caller uses API or MCP
+- first-attempt outbound write results also emit append-only child journal
+  events for Receipts subscriptions:
+  - `slack.outbound.message.sent`
+  - `slack.outbound.thread_reply.sent`
+  - `slack.outbound.reaction.added`
+  - `slack.outbound.reaction.removed`
+  - `slack.outbound.write.failed`
+- idempotent replays return the existing outbound action and do not emit a new
+  journal row
+
+Reaction status signal request fields:
+
+- `channel_ref`
+- `message_ts` or `ts`
+- `reaction` or `name`
+- `action`
+  - `add`
+  - `remove`
+- `idempotency_key`
+- `auth_mode`
+  - defaults to `bot`
+
+Reaction status signal semantics:
+
+- reaction names may be sent with or without surrounding colons
+- Slack `already_reacted` during add and `no_reaction` during remove are treated
+  as converged successful outcomes
+- use reactions for lightweight received/working/applied/blocked indicators,
+  and use `messages.send` / `threads.reply` only when a human-readable status
+  message is needed
+- downstream subscribers should follow `slack.thread_reply.created` or
+  `slack.message.created` for human input, then request a reaction write and
+  follow `slack.outbound.reaction.added` / `slack.outbound.reaction.removed`
+  for write completion
+
+CRM/report egress recipe:
+
+- Use `messages.send` for the report title/root message with a stable
+  report-scoped `idempotency_key`.
+- Use `threads.reply` for the report body with a second stable
+  `idempotency_key`, targeting the root message timestamp returned by
+  `messages.send`.
+- Use `threads.reply` again for approval prompts when a human-readable prompt is
+  needed; use `reactions.add` / `reactions.remove` for lightweight received,
+  working, applied, or blocked status signals after a human replies.
+- Persist the returned normalized action payloads, especially `id`,
+  `channel_id`, `thread_ts`, `response.ts`, `idempotency_key`, and
+  `idempotent_replay`.
+- On retry, reuse the same idempotency keys. Slack Mirror returns the existing
+  action and does not send a duplicate Slack write or emit a duplicate outbound
+  journal row.
+- Downstream approval interpretation remains downstream-owned. Slack Mirror
+  provides stable refs through outbound action payloads, child event rows,
+  listener deliveries, `/v1/events/follow`, and direct thread retrieval; it does
+  not decide whether a reply means approve, block, or needs review.
+
+## Channel Management Success
+
+API:
+
+- `POST /v1/workspaces/{workspace}/channels`
+
+MCP:
+
+- `channels.create`
+
+Request fields:
+
+- `workspace`
+- `name`
+- `is_private`
+- `invitees`
+- `options.auth_mode`
+
+Successful channel-management actions return:
+
+- `workspace`
+- `requested_name`
+- `name`
+- `channel_id`
+- `is_private`
+- `created`
+- `invited_user_ids`
+- `invitees`
+- `auth_mode`
+
+Slack Mirror resolves invitees against mirrored users before creating a new channel. If a user reference is missing or ambiguous, the operation fails before the Slack write. If a same-name mirrored channel already exists, Slack Mirror reuses it only when the requested public/private setting matches.
+
+## Listener Registration
+
+API:
+
+- `POST /v1/workspaces/{workspace}/listeners`
+- `GET /v1/workspaces/{workspace}/listeners`
+- `GET /v1/workspaces/{workspace}/listeners/{listener_id}`
+- `DELETE /v1/workspaces/{workspace}/listeners/{listener_id}`
+
+MCP:
+
+- `listeners.register`
+- `listeners.list`
+- `listeners.status`
+- `listeners.unregister`
+
+Listener registration is name-keyed within a workspace. Re-registering the same listener name updates the existing registration instead of creating a duplicate row.
+
+Important listener fields:
+
+- `id`
+- `workspace_id`
+- `name`
+- `event_types_json`
+- `channel_ids_json`
+- `target`
+- `delivery_mode`
+- `enabled`
+- `created_at`
+- `updated_at`
+
+Registration/filtering semantics:
+
+- `name` is required
+- `event_types` is optional
+  - empty means all event types in the local listener model
+- `channel_ids` is optional
+  - empty means all channels
+- both filters are conjunctive when present
+  - event type must match if `event_types` is set
+  - channel must match if `channel_ids` is set and the payload has a channel
+- current default `delivery_mode` is `queue`
+
+## Listener Deliveries
+
+API:
+
+- `GET /v1/workspaces/{workspace}/deliveries`
+- `POST /v1/workspaces/{workspace}/deliveries/{delivery_id}/ack`
+
+MCP:
+
+- `deliveries.list`
+- `deliveries.ack`
+
+Delivery rows currently return these important fields:
+
+- `id`
+- `workspace_id`
+- `listener_id`
+- `event_type`
+- `source_kind`
+- `source_ref`
+- `payload_json`
+- `status`
+- `attempts`
+- `error`
+- `delivered_at`
+- `created_at`
+- `updated_at`
+
+Current delivery status model:
+
+- `pending`
+- `delivered`
+- `failed`
+
+Acknowledgement semantics:
+
+- `deliveries.ack` / `POST .../ack` updates exactly one existing delivery row in the addressed workspace
+- default ack status is `delivered`
+- callers may also set `status` explicitly, including `failed`
+- `attempts` increments on every acknowledgement write
+- `delivered_at` is set on acknowledgement, including failed acknowledgements
+- `error` may be attached to record consumer failure detail
+
+Consumer guidance:
+
+- use `status=pending` polling for queue-like consumption
+- ack with `delivered` only after the subscribed process has accepted the delivery
+- ack with `failed` plus `error` when the consumer handled the delivery attempt but could not complete downstream work
+- treat `payload_json` as the canonical event payload body for the delivery row
+
+## Error Envelope
+
+API errors return:
+
+```json
+{
+  "ok": false,
+  "error": {
+    "code": "INVALID_ARGUMENT",
+    "message": "channel_ref is required",
+    "retryable": false,
+    "details": {
+      "operation": "messages.send",
+      "workspace": "default"
+    }
+  }
+}
+```
+
+MCP errors return the same machine-readable envelope in JSON-RPC `error.data`:
+
+```json
+{
+  "error": {
+    "code": -32602,
+    "message": "channel_ref is required",
+    "data": {
+      "code": "INVALID_ARGUMENT",
+      "message": "channel_ref is required",
+      "retryable": false,
+      "details": {
+        "tool": "messages.send"
+      }
+    }
+  }
+}
+```
+
+Stable shared fields:
+
+- `code`
+- `message`
+- `retryable`
+- `details`
+
+Current stable service error codes include:
+
+- `INVALID_ARGUMENT`
+- `INVALID_REQUEST`
+- `NOT_FOUND`
+- `AMBIGUOUS_TARGET`
+- `AUTH_CONFIGURATION_ERROR`
+- `UPSTREAM_ERROR`
+- `METHOD_NOT_FOUND`
+- `INTERNAL_ERROR`
+
+## Caller Guidance
+
+- Prefer structured fields over parsing human-readable text.
+- Treat `retryable` as transport guidance, not a guarantee that an immediate retry is safe under all product conditions.
+- Use idempotency keys for write actions whenever retries, agent loops, or network retries are possible.
+- For live health, key off `status`, `failure_codes`, and per-workspace queue fields rather than the freeform `summary`.
