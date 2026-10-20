@@ -117,7 +117,7 @@ class InteractiveActions:
             return self.send(conn, workspace, application, destination, body)
         elements = [{'type': 'button', 'text': {'type': 'plain_text', 'text': value['label']}, 'action_id': key, 'value': nonce} for key, value in buttons.items()]
         blocks = [{'type': 'section', 'text': {'type': 'plain_text', 'text': body['message'][i:i+3000]}} for i in range(0, len(body['message']), 3000)]
-        blocks.extend({'type': 'actions', 'block_id': nonce, 'elements': elements[i:i+5]} for i in range(0, len(elements), 5))
+        blocks.append({'type': 'actions', 'block_id': nonce, 'elements': elements})
         try:
             response = client.send_message(channel=channel, text=body['message'], blocks=blocks)
             if response.get('ok') and response.get('channel') == channel and isinstance(response.get('ts'), str):

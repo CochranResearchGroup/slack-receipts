@@ -66,6 +66,22 @@ workspaces:
             'actor': 'slack:TSYNTHETIC:USYNTHETIC', 'action': 'accept', 'payload': {'duration': 'once'}}])
         self.assertEqual(self.actions.receive(self.conn, 'fixture', 'reports', 'request-1'), [])
 
+    def test_seven_buttons_use_unique_block_ids_and_all_remain_clickable(self):
+        definition = json.loads(json.dumps(DEFINITION))
+        definition['actions'][0]['payloadSchema']['properties']['duration']['enum'] += ['five-minutes', 'eight-hours']
+        with patch.dict(DEFINITION, definition):
+            self.send()
+        blocks = [block for block in self.blocks if block['type'] == 'actions']
+        self.assertEqual(sum(len(block['elements']) for block in blocks), 7)
+        self.assertEqual(len({block['block_id'] for block in blocks}), len(blocks))
+        self.assertTrue(all(len(block['elements']) <= 25 for block in blocks))
+        block = blocks[-1]
+        button = block['elements'][-1]
+        payload = self.payload()
+        payload['actions'] = [{'type': 'button', 'block_id': block['block_id'], 'action_id': button['action_id'], 'value': button['value']}]
+        self.assertTrue(self.actions.capture(self.conn, 'fixture', 'seven-button-click', payload))
+        self.assertEqual(self.actions.receive(self.conn, 'fixture', 'auth', 'request-1')[0]['action'], 'decline')
+
     def test_rejected_stale_forged_and_wrong_message_actions_never_become_responses(self):
         self.send()
         for changed in [ {'team': {'id': 'TOTHER'}}, {'api_app_id': 'AOTHER'}, {'user': {'id': ''}},
