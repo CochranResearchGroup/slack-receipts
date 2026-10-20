@@ -527,6 +527,8 @@ def _tenant_execution_contract() -> dict[str, Any]:
 
 
 def _requires_same_origin_write(path: str) -> bool:
+    if re.fullmatch(r'/v1/workspaces/[^/]+/applications/[^/]+/interactive', path):
+        return True
     if path in {"/auth/register", "/auth/login", "/auth/logout"}:
         return True
     if re.fullmatch(r"/auth/sessions/\d+/revoke", path):
@@ -3495,6 +3497,18 @@ def create_api_server(*, bind: str, port: int, config_path: str | None = None) -
                 auth_session = self._enforce_frontend_auth(path)
                 if auth_session is None:
                     return
+            interactive_route = re.fullmatch(r'/v1/workspaces/([^/]+)/applications/([^/]+)/interactive', path)
+            if interactive_route:
+                if not auth_config.enabled or not self._frontend_auth_session().authenticated:
+                    _error_response(self, 401, 'AUTH_REQUIRED', 'Authenticated owner session required')
+                    return
+                try:
+                    length = int(self.headers.get('content-length', '0'))
+                except ValueError:
+                    length = -1
+                if length < 0 or length > 65536:
+                    _error_response(self, 400, 'INVALID_REQUEST', 'Bounded JSON body required')
+                    return
             try:
                 body = _parse_json_body(self)
             except json.JSONDecodeError as exc:
@@ -3506,6 +3520,33 @@ def create_api_server(*, bind: str, port: int, config_path: str | None = None) -
                 if csrf_error:
                     _error_response(self, 403, "CSRF_FAILED", csrf_error)
                     return
+
+            if interactive_route:
+                from slack_mirror.service.interactive import InteractiveActions
+                workspace, application = map(unquote, interactive_route.groups())
+                conn = service.connect()
+                try:
+                    actions = InteractiveActions(service)
+                    if not isinstance(body, dict):
+                        raise ValueError('invalid_request')
+                    operation = body.get('operation')
+                    if operation in ('install', 'inspect') and set(body) == {'operation', 'definition'}:
+                        result = (actions.install if operation == 'install' else actions.installed)(conn, workspace, application, body['definition'])
+                    elif operation == 'send' and set(body) == {'operation', 'destination', 'request'}:
+                        result = actions.send(conn, workspace, application, body['destination'], body['request'])
+                    elif operation == 'receive' and set(body) == {'operation', 'requestId'}:
+                        result = actions.receive(conn, workspace, application, body['requestId'])
+                    else:
+                        raise ValueError('invalid_interactive_operation')
+                except (ValueError, KeyError, TypeError):
+                    _error_response(self, 400, 'INVALID_REQUEST', 'Invalid interactive request')
+                except Exception:
+                    _error_response(self, 503, 'INTERACTIVE_UNAVAILABLE', 'Interactive operation unavailable')
+                else:
+                    _json_response(self, 200, {'ok': True, 'result': result})
+                finally:
+                    conn.close()
+                return
 
             if path == "/auth/register":
                 conn = service.connect()

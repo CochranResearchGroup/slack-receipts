@@ -191,3 +191,11 @@ slack-mirror-user user-env check-live --json
 ```
 
 Repeat the same process for each workspace. Keep one manifest template; only rendered app name and credentials differ per workspace.
+
+## Interactive application actions
+
+The Socket Mode templates enable interactivity for installed application buttons.
+Apply the manifest to the intended app and enroll its app ID in private workspace
+configuration only in a bounded installation task. Template publication does not
+change the installed workspace. Socket Mode carries authenticated action payloads;
+no new HTTP Request URL is required. See [interactive actions](INTERACTIVE_ACTIONS.md).

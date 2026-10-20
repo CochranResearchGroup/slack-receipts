@@ -1651,3 +1651,13 @@ Current stable service error codes include:
 - Treat `retryable` as transport guidance, not a guarantee that an immediate retry is safe under all product conditions.
 - Use idempotency keys for write actions whenever retries, agent loops, or network retries are possible.
 - For live health, key off `status`, `failure_codes`, and per-workspace queue fields rather than the freeform `summary`.
+
+## Installed application actions
+
+The authenticated owner API now supports reusable application action installation,
+interactive sends and correlated response readback at
+`POST /v1/workspaces/{workspace}/applications/{application}/interactive`.
+See [the exact contract and recovery rules](INTERACTIVE_ACTIONS.md). Actor capture
+is internal to authenticated Socket Mode; there is no model-facing or HTTP
+actor/assertion endpoint. This capability is API-only; existing MCP outbound and
+event contracts remain unchanged.
