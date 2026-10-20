@@ -84,11 +84,26 @@ def run_webhook_server(
     server.serve_forever()
 
 
+def dispatch_socket_request(client, request, *, on_event, on_interactive=None):
+    """Dispatch only SDK-delivered envelopes from the authenticated Socket Mode connection."""
+    from slack_sdk.socket_mode.response import SocketModeResponse
+    if request.type == 'interactive':
+        if on_interactive is not None:
+            # Commit the response before ACK. A persistence failure lets Slack
+            # retry the original envelope; handlers must never send from here.
+            on_interactive(request.envelope_id, request.payload)
+        client.send_socket_mode_response(SocketModeResponse(envelope_id=request.envelope_id))
+    elif request.type == 'events_api':
+        client.send_socket_mode_response(SocketModeResponse(envelope_id=request.envelope_id))
+        on_event(request.payload)
+
+
 def run_socket_mode(
     *,
     app_token: str,
     bot_token: str,
     on_event,
+    on_interactive=None,
 ) -> None:
     from slack_sdk.web import WebClient
     from slack_sdk.socket_mode import SocketModeClient
@@ -105,12 +120,7 @@ def run_socket_mode(
 
     def process_event(client: SocketModeClient, req: SocketModeRequest):
         print(f"Received Socket Mode event: {req.type}", flush=True)
-        if req.type == "events_api":
-            response = SocketModeResponse(envelope_id=req.envelope_id)
-            client.send_socket_mode_response(response)
-            on_event(req.payload)
-        elif req.type == "hello":
-            print("Socket Mode connected successfully", flush=True)
+        dispatch_socket_request(client, req, on_event=on_event, on_interactive=on_interactive)
 
     client.socket_mode_request_listeners.append(process_event)
     client.connect()

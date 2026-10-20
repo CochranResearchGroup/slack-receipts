@@ -63,3 +63,15 @@ while legacy Slack Mirror command aliases remain available where documented.
 ## License
 
 See `LICENSE`.
+
+## Routed application actions
+
+Slack Receipts can install reusable action definitions for owner-enrolled
+applications, render message buttons and persist attributable responses received
+through authenticated Socket Mode. The parent Receipts hub owns user-scoped
+routing and the application's send/receive interface. Domain authorization stays
+with the consuming application. See [interactive actions](docs/INTERACTIVE_ACTIONS.md).
+
+This is source functionality. Updating templates does not update an installed
+Slack app, enable private configuration or send messages. Live installation and
+acceptance require a separately bounded operator task.
