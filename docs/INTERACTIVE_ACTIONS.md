@@ -96,3 +96,16 @@ persistence-before-ACK. They do not contact Slack or install an app.
 The parent actual-source harness independently launches this child API and
 Socket dispatcher with controlled Slack transport. Live installed-workspace
 qualification remains separate from source integration.
+
+## Visible confirmation
+
+After a valid response is saved and the Socket envelope is acknowledged, the
+child updates the same original message to remove action buttons and display
+“Response recorded. Thank you.” This confirms response capture, not a grant,
+application authorization or successful authentication. No second message is sent.
+The confirmation receipt is separate from the immutable original response.
+Unknown update outcomes retain their state. Repeated updates converge on identical
+content at the same channel/timestamp; original application actions are never
+replayed. On receiver startup, at most ten pending confirmations are reconciled.
+The original request and enrolled workspace/app identity are revalidated before
+editing. See Slack's [chat.update contract](https://docs.slack.dev/reference/methods/chat.update/).

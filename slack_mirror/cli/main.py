@@ -535,11 +535,31 @@ def cmd_serve_socket_mode(args: argparse.Namespace) -> int:
             return
         connection = service.connect()
         try:
-            InteractiveActions(service).capture(connection, args.workspace, envelope_id, payload)
+            return InteractiveActions(service).capture(connection, args.workspace, envelope_id, payload)
         finally:
             connection.close()
 
-    run_socket_mode(app_token=app_token, bot_token=bot_token, on_event=on_event, on_interactive=on_interactive)
+    def after_interactive(payload):
+        from slack_mirror.service.app import get_app_service
+        from slack_mirror.service.interactive import InteractiveActions
+        service = get_app_service(args.config)
+        connection = service.connect()
+        try:
+            InteractiveActions(service).confirm_interaction(connection, args.workspace, payload)
+        finally:
+            connection.close()
+
+    if ws_cfg.get('interactive', {}).get('enabled') is True:
+        from slack_mirror.service.app import get_app_service
+        from slack_mirror.service.interactive import InteractiveActions
+        service = get_app_service(args.config)
+        connection = service.connect()
+        try:
+            InteractiveActions(service).confirm_pending(connection, args.workspace)
+        finally:
+            connection.close()
+
+    run_socket_mode(app_token=app_token, bot_token=bot_token, on_event=on_event, on_interactive=on_interactive, after_interactive=after_interactive)
     return 0
 
 
