@@ -8,7 +8,34 @@ import json
 import re
 import secrets
 import time
+from urllib.parse import urlsplit
 from slack_mirror.core.slack_api import SlackApiClient
+
+
+def message_blocks(message):
+    blocks = []
+    for offset in range(0, len(message), 3000):
+        text = message[offset:offset+3000]
+        elements, cursor = [], 0
+        for match in re.finditer(r'https://[^\s<>]+', text):
+            url = match.group().rstrip('.,;!?)')
+            try:
+                parsed = urlsplit(url)
+                if not parsed.hostname or parsed.username or parsed.password:
+                    continue
+            except ValueError:
+                continue
+            if match.start() > cursor:
+                elements.append({'type': 'text', 'text': text[cursor:match.start()]})
+            elements.append({'type': 'link', 'url': url})
+            cursor = match.start() + len(url)
+        if cursor:
+            if cursor < len(text):
+                elements.append({'type': 'text', 'text': text[cursor:]})
+            blocks.append({'type': 'rich_text', 'elements': [{'type': 'rich_text_section', 'elements': elements}]})
+        else:
+            blocks.append({'type': 'section', 'text': {'type': 'plain_text', 'text': text}})
+    return blocks
 
 
 def token(value):
@@ -116,7 +143,7 @@ class InteractiveActions:
         if not claim.rowcount:
             return self.send(conn, workspace, application, destination, body)
         elements = [{'type': 'button', 'text': {'type': 'plain_text', 'text': value['label']}, 'action_id': key, 'value': nonce} for key, value in buttons.items()]
-        blocks = [{'type': 'section', 'text': {'type': 'plain_text', 'text': body['message'][i:i+3000]}} for i in range(0, len(body['message']), 3000)]
+        blocks = message_blocks(body['message'])
         blocks.append({'type': 'actions', 'block_id': nonce, 'elements': elements})
         try:
             response = client.send_message(channel=channel, text=body['message'], blocks=blocks)
@@ -172,7 +199,7 @@ class InteractiveActions:
             return {'status': 'confirmed'}
         body = json.loads(row['body'])
         text = body['message']
-        blocks = [{'type': 'section', 'text': {'type': 'plain_text', 'text': text[i:i+3000]}} for i in range(0, len(text), 3000)]
+        blocks = message_blocks(text)
         blocks.append({'type': 'context', 'elements': [{'type': 'plain_text', 'text': 'Response recorded. Thank you.'}]})
         status = 'unknown'
         try:

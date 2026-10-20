@@ -82,6 +82,22 @@ workspaces:
         self.assertTrue(self.actions.capture(self.conn, 'fixture', 'seven-button-click', payload))
         self.assertEqual(self.actions.receive(self.conn, 'fixture', 'auth', 'request-1')[0]['action'], 'decline')
 
+    def test_https_links_are_clickable_and_mentions_stay_literal_through_confirmation(self):
+        self.request['message'] = 'Sign in\nhttps://example.test\n<@UOTHER> <!channel> *literal*'
+        self.send()
+        rich = [b for b in self.blocks if b['type'] == 'rich_text']
+        self.assertEqual(len(rich), 1)
+        elements = rich[0]['elements'][0]['elements']
+        self.assertEqual([e for e in elements if e['type'] == 'link'], [{'type': 'link', 'url': 'https://example.test'}])
+        self.assertIn('<@UOTHER> <!channel> *literal*', ''.join(e.get('text', '') for e in elements))
+        self.actions.capture(self.conn, 'fixture', 'link-click', self.payload())
+        with patch('slack_mirror.service.interactive.SlackApiClient') as api:
+            api.return_value.client.chat_update.return_value = {'ok': True, 'channel': 'CSYNTHETIC', 'ts': '100.001'}
+            self.actions.confirm_message(self.conn, 'fixture', 'auth', 'request-1')
+            updated = api.return_value.client.chat_update.call_args.kwargs['blocks']
+            self.assertEqual(updated[0], rich[0])
+            self.assertFalse(any(b['type'] == 'actions' for b in updated))
+
     def test_rejected_stale_forged_and_wrong_message_actions_never_become_responses(self):
         self.send()
         for changed in [ {'team': {'id': 'TOTHER'}}, {'api_app_id': 'AOTHER'}, {'user': {'id': ''}},
