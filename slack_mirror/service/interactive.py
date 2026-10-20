@@ -156,4 +156,56 @@ class InteractiveActions:
         event = {'id': envelope_id, 'requestId': row['request_id'], 'applicationId': row['application'], 'actionSet': body['actionSet'], 'version': body['version'], 'actor': f'slack:{team}:{actor}', 'action': button['action'], 'payload': button['payload']}
         with conn:
             conn.execute("UPDATE interactive_requests SET response=?, delivery='delivered', message_ts=? WHERE workspace_id=? AND application=? AND request_id=? AND response IS NULL", (canonical(event), container['message_ts'], workspace_id, row['application'], row['request_id']))
+            conn.execute("INSERT OR IGNORE INTO interactive_confirmations VALUES(?,?,?,'pending')", (workspace_id, row['application'], row['request_id']))
         return True
+
+    def confirm_message(self, conn, workspace, application, request_id):
+        """Convergently update only the original responded message, never resend it."""
+        workspace_id, team, app = self.enrolled(conn, workspace, application)
+        row = conn.execute('SELECT * FROM interactive_requests WHERE workspace_id=? AND application=? AND request_id=?', (workspace_id, application, request_id)).fetchone()
+        if not row or not row['response'] or not row['message_ts'] or row['team_id'] != team or row['app_id'] != app:
+            return {'status': 'unavailable'}
+        with conn:
+            conn.execute("INSERT OR IGNORE INTO interactive_confirmations VALUES(?,?,?,'pending')", (workspace_id, application, request_id))
+        prior = conn.execute('SELECT state FROM interactive_confirmations WHERE workspace_id=? AND application=? AND request_id=?', (workspace_id, application, request_id)).fetchone()
+        if prior['state'] == 'confirmed':
+            return {'status': 'confirmed'}
+        body = json.loads(row['body'])
+        text = body['message']
+        blocks = [{'type': 'section', 'text': {'type': 'plain_text', 'text': text[i:i+3000]}} for i in range(0, len(text), 3000)]
+        blocks.append({'type': 'context', 'elements': [{'type': 'plain_text', 'text': 'Response recorded. Thank you.'}]})
+        status = 'unknown'
+        try:
+            client = SlackApiClient(self.service.workspace_token(workspace, purpose='write'), max_rate_limit_retries=0)
+            client.client.retry_handlers = []
+            result = client.client.chat_update(channel=row['channel'], ts=row['message_ts'], text=text+'\nResponse recorded. Thank you.', blocks=blocks)
+            if result.get('ok') and result.get('channel') == row['channel'] and result.get('ts') == row['message_ts']:
+                status = 'confirmed'
+        except Exception:
+            pass
+        with conn:
+            # A lost acknowledgement cannot overwrite another owner's confirmation.
+            conn.execute("UPDATE interactive_confirmations SET state=? WHERE workspace_id=? AND application=? AND request_id=? AND state!='confirmed'", (status, workspace_id, application, request_id))
+        return {'status': status}
+
+
+    def confirm_interaction(self, conn, workspace, payload):
+        workspace_id, _, _ = self.enrolled(conn, workspace)
+        actions = payload.get('actions') or []
+        if len(actions) != 1:
+            return {'status': 'unavailable'}
+        row = conn.execute('SELECT application,request_id FROM interactive_requests WHERE workspace_id=? AND nonce=?', (workspace_id, actions[0].get('block_id'))).fetchone()
+        if not row:
+            return {'status': 'unavailable'}
+        return self.confirm_message(conn, workspace, row['application'], row['request_id'])
+
+    def confirm_pending(self, conn, workspace):
+        workspace_id, _, _ = self.enrolled(conn, workspace)
+        rows = conn.execute("SELECT r.application,r.request_id FROM interactive_requests r LEFT JOIN interactive_confirmations c ON c.workspace_id=r.workspace_id AND c.application=r.application AND c.request_id=r.request_id WHERE r.workspace_id=? AND r.response IS NOT NULL AND (c.state IS NULL OR c.state!='confirmed') LIMIT 10", (workspace_id,)).fetchall()
+        results = []
+        for row in rows:
+            try:
+                results.append(self.confirm_message(conn, workspace, row['application'], row['request_id']))
+            except ValueError:
+                continue  # A removed enrollment has no further channel authority.
+        return results

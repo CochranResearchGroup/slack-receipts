@@ -26,6 +26,7 @@ workspaces:
   - name: fixture
     team_id: TSYNTHETIC
     token: synthetic
+    app_token: synthetic
     outbound_token: synthetic
     interactive:
       enabled: true
@@ -181,6 +182,63 @@ workspaces:
         texts = [block['text']['text'] for block in self.blocks if block['type'] == 'section']
         self.assertEqual(''.join(texts), self.request['message'])
         self.assertTrue(all(len(value) <= 3000 for value in texts))
+
+    def test_confirmed_response_updates_original_message_and_removes_buttons(self):
+        self.send()
+        self.actions.capture(self.conn, 'fixture', 'confirmation-event', self.payload())
+        original = self.actions.receive(self.conn, 'fixture', 'auth', 'request-1')
+        with patch('slack_mirror.service.interactive.SlackApiClient') as api:
+            api.return_value.client.chat_update.return_value = {'ok': True, 'channel': 'CSYNTHETIC', 'ts': '100.001'}
+            result = self.actions.confirm_message(self.conn, 'fixture', 'auth', 'request-1')
+            self.assertEqual(result, {'status': 'confirmed'})
+            update = api.return_value.client.chat_update.call_args.kwargs
+            self.assertEqual((update['channel'], update['ts']), ('CSYNTHETIC', '100.001'))
+            self.assertFalse(any(block['type'] == 'actions' for block in update['blocks']))
+            self.assertIn('Response recorded', json.dumps(update['blocks']))
+            self.actions.confirm_message(self.conn, 'fixture', 'auth', 'request-1')
+            self.assertEqual(api.return_value.client.chat_update.call_count, 1)
+        self.assertEqual(self.actions.receive(self.conn, 'fixture', 'auth', 'request-1'), original)
+
+    def test_confirmation_runs_after_socket_ack_and_reconciles_lost_update_ack(self):
+        from types import SimpleNamespace
+        from slack_mirror.service.server import dispatch_socket_request
+        self.send()
+        order = []
+        request = SimpleNamespace(type='interactive', envelope_id='confirmed', payload=self.payload())
+        client = SimpleNamespace(send_socket_mode_response=lambda value: order.append('ack'))
+        with patch('slack_mirror.service.interactive.SlackApiClient') as api:
+            def lost_ack(**kwargs):
+                order.append('update')
+                raise OSError('lost update acknowledgement')
+            api.return_value.client.chat_update.side_effect = lost_ack
+            dispatch_socket_request(client, request, on_event=lambda value: None,
+                on_interactive=lambda identity, payload: self.actions.capture(self.conn, 'fixture', identity, payload),
+                after_interactive=lambda payload: self.actions.confirm_interaction(self.conn, 'fixture', payload))
+            self.assertEqual(order, ['ack', 'update'])
+            original = self.actions.receive(self.conn, 'fixture', 'auth', 'request-1')
+            peer = self.service.connect()
+            self.addCleanup(peer.close)
+            api.return_value.client.chat_update.side_effect = None
+            api.return_value.client.chat_update.return_value = {'ok': True, 'channel': 'CSYNTHETIC', 'ts': '100.001'}
+            statuses = InteractiveActions(self.service).confirm_pending(peer, 'fixture')
+            self.assertEqual(statuses, [{'status': 'confirmed'}])
+            calls = api.return_value.client.chat_update.call_args_list
+            self.assertEqual(calls[0].kwargs, calls[1].kwargs)
+            self.assertEqual(self.actions.receive(peer, 'fixture', 'auth', 'request-1'), original)
+
+    def test_cli_wires_post_ack_confirmation_without_losing_socket_event_callbacks(self):
+        from types import SimpleNamespace
+        from slack_mirror.cli.main import cmd_serve_socket_mode
+        self.send()
+        payload = self.payload()
+        def socket_driver(**callbacks):
+            self.assertIn('on_event', callbacks)
+            self.assertTrue(callbacks['on_interactive']('cli-confirmed', payload))
+            callbacks['after_interactive'](payload)
+        with patch('slack_mirror.service.server.run_socket_mode', side_effect=socket_driver), patch('slack_mirror.service.interactive.SlackApiClient') as api:
+            api.return_value.client.chat_update.return_value = {'ok': True, 'channel': 'CSYNTHETIC', 'ts': '100.001'}
+            self.assertEqual(cmd_serve_socket_mode(SimpleNamespace(config=self.config_path, workspace='fixture')), 0)
+            self.assertEqual(api.return_value.client.chat_update.call_count, 1)
 
 if __name__ == '__main__':
     unittest.main()
